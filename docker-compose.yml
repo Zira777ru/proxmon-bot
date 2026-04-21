@@ -2,6 +2,8 @@ services:
   proxmon-bot:
     build: .
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - proxmon-data:/data
       - /var/run/docker.sock:/var/run/docker.sock
