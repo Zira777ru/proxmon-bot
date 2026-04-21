@@ -1,0 +1,22 @@
+services:
+  proxmon-bot:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - proxmon-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PROXMOX_HOST=192.168.0.50
+      - PROXMOX_NODE=pve
+      - PROXMOX_USER=root@pam
+      - PROXMOX_TOKEN_NAME=proxmon-bot
+      - CHECK_INTERVAL=60
+      - CPU_WARN=85
+      - MEM_WARN=90
+      - DISK_WARN=85
+      - SUMMARY_HOUR=9
+      - ALERT_COOLDOWN=1800
+      - DB_PATH=/data/monitor.db
+
+volumes:
+  proxmon-data:
