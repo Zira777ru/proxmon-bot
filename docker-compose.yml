@@ -7,6 +7,8 @@ services:
     volumes:
       - proxmon-data:/data
       - /var/run/docker.sock:/var/run/docker.sock
+      - /home/igor/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+      - /home/igor/.ssh/known_hosts:/root/.ssh/known_hosts:ro
     environment:
       - PROXMOX_HOST=192.168.0.50
       - PROXMOX_NODE=pve
@@ -16,9 +18,16 @@ services:
       - CPU_WARN=85
       - MEM_WARN=90
       - DISK_WARN=85
+      - TEMP_WARN=80
+      - BACKUP_MAX_AGE_HOURS=25
+      - CRASH_LOOP_MIN_RESTARTS=3
+      - SSL_WARN_DAYS=14
+      - VOLUME_WARN_GB=10
       - SUMMARY_HOUR=9
       - ALERT_COOLDOWN=1800
       - DB_PATH=/data/monitor.db
+      - BACKUP_WINDOW_START=2
+      - BACKUP_WINDOW_END=4
 
 volumes:
   proxmon-data:

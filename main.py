@@ -1,19 +1,20 @@
 import asyncio
 import logging
 import os
+import re
 import socket
 import sqlite3
 import ssl
+import subprocess
 import time
 from datetime import datetime, timedelta, time as dtime
 
 import requests
 import urllib3
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, CallbackContext
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -30,12 +31,16 @@ CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL", "60"))
 CPU_WARN            = int(os.getenv("CPU_WARN", "85"))
 MEM_WARN            = int(os.getenv("MEM_WARN", "90"))
 DISK_WARN           = int(os.getenv("DISK_WARN", "85"))
-SUMMARY_HOUR        = int(os.getenv("SUMMARY_HOUR", "9"))
-ALERT_COOLDOWN      = int(os.getenv("ALERT_COOLDOWN", "1800"))
-DB_PATH             = os.getenv("DB_PATH", "/data/monitor.db")
+TEMP_WARN           = int(os.getenv("TEMP_WARN", "80"))
 BACKUP_MAX_AGE_H    = int(os.getenv("BACKUP_MAX_AGE_HOURS", "25"))
 CRASH_LOOP_MIN      = int(os.getenv("CRASH_LOOP_MIN_RESTARTS", "3"))
 SSL_WARN_DAYS       = int(os.getenv("SSL_WARN_DAYS", "14"))
+VOLUME_WARN_GB      = int(os.getenv("VOLUME_WARN_GB", "10"))
+SUMMARY_HOUR        = int(os.getenv("SUMMARY_HOUR", "9"))
+ALERT_COOLDOWN      = int(os.getenv("ALERT_COOLDOWN", "1800"))
+DB_PATH             = os.getenv("DB_PATH", "/data/monitor.db")
+BACKUP_WIN_START    = int(os.getenv("BACKUP_WINDOW_START", "2"))
+BACKUP_WIN_END      = int(os.getenv("BACKUP_WINDOW_END", "4"))
 WATCH_URLS_EXTRA    = [u.strip() for u in os.getenv("WATCH_URLS", "").split(",") if u.strip()]
 COOLIFY_API         = os.getenv("COOLIFY_API_URL", "http://host.docker.internal:8000/api/v1")
 COOLIFY_TOKEN       = os.getenv("COOLIFY_API_TOKEN", "")
@@ -44,66 +49,22 @@ WATCH_DOMAIN_FILTER = os.getenv("WATCH_DOMAIN_FILTER", "coscore.us")
 PX_BASE    = f"https://{PX_HOST}:8006/api2/json"
 PX_HEADERS = {"Authorization": f"PVEAPIToken={PX_USER}!{PX_TOKEN_NAME}={PX_TOKEN_VALUE}"}
 
-# ── Coolify auto-discovery ────────────────────────────────────────────────────
-_watch_urls_cache: list[str] = []
-_watch_urls_ts: float = 0
-WATCH_CACHE_TTL = 300  # 5 min
-
-def discover_watch_urls() -> list[str]:
-    global _watch_urls_cache, _watch_urls_ts
-    if time.time() - _watch_urls_ts < WATCH_CACHE_TTL and _watch_urls_cache:
-        return _watch_urls_cache
-
-    urls: set[str] = set(WATCH_URLS_EXTRA)
-    hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
-
-    try:
-        # Applications
-        r = requests.get(f"{COOLIFY_API}/applications", headers=hdrs, timeout=5)
-        for app in r.json():
-            fqdn = app.get("fqdn", "") or ""
-            for part in fqdn.split(","):
-                part = part.strip()
-                if WATCH_DOMAIN_FILTER in part and "sslip.io" not in part:
-                    if not part.startswith("http"):
-                        part = "https://" + part
-                    urls.add(part)
-    except Exception as e:
-        log.error(f"Coolify apps discovery: {e}")
-
-    try:
-        # Services — extract COOLIFY_FQDN from compose env
-        import re
-        r = requests.get(f"{COOLIFY_API}/services", headers=hdrs, timeout=5)
-        for svc in r.json():
-            compose = svc.get("docker_compose", "") or ""
-            for fqdn in re.findall(r"COOLIFY_FQDN:\s*([^\s\n]+)", compose):
-                if WATCH_DOMAIN_FILTER in fqdn and "sslip.io" not in fqdn:
-                    urls.add("https://" + fqdn)
-    except Exception as e:
-        log.error(f"Coolify services discovery: {e}")
-
-    result = sorted(urls)
-    if result:
-        _watch_urls_cache = result
-        _watch_urls_ts = time.time()
-        log.info(f"Discovered {len(result)} watch URLs: {result}")
-    return result
-
 # ── DB ────────────────────────────────────────────────────────────────────────
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.executescript("""
-        CREATE TABLE IF NOT EXISTS state  (key TEXT PRIMARY KEY, value TEXT, ts INTEGER);
-        CREATE TABLE IF NOT EXISTS alerts (key TEXT PRIMARY KEY, last_sent INTEGER);
+        CREATE TABLE IF NOT EXISTS state   (key TEXT PRIMARY KEY, value TEXT, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS alerts  (key TEXT PRIMARY KEY, last_sent INTEGER);
+        CREATE TABLE IF NOT EXISTS metrics (date TEXT, key TEXT, value REAL,
+                                            PRIMARY KEY (date, key));
     """)
     con.commit()
     return con
 
-def get_state(con, key):
+def get_state(con, key, default=None):
     row = con.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
-    return row[0] if row else None
+    return row[0] if row else default
 
 def set_state(con, key, value):
     con.execute("INSERT OR REPLACE INTO state VALUES(?,?,?)", (key, str(value), int(time.time())))
@@ -122,21 +83,35 @@ def clear_alert(con, key):
     con.commit()
 
 def is_silenced(con):
-    until = get_state(con, "silence_until")
-    return until and time.time() < float(until)
+    until = get_state(con, "silence_until", "0")
+    return time.time() < float(until)
 
-# ── Gemini AI — только при алерте ────────────────────────────────────────────
+def in_backup_window():
+    h = datetime.now().hour
+    return BACKUP_WIN_START <= h < BACKUP_WIN_END
+
+def store_metric(con, key, value):
+    day = datetime.now().strftime("%Y-%m-%d")
+    con.execute("INSERT OR REPLACE INTO metrics VALUES(?,?,?)", (day, key, value))
+    con.commit()
+
+def get_metric_history(con, key, days=7):
+    rows = con.execute(
+        "SELECT date, value FROM metrics WHERE key=? ORDER BY date DESC LIMIT ?",
+        (key, days)
+    ).fetchall()
+    return list(reversed(rows))
+
+# ── Gemini AI ─────────────────────────────────────────────────────────────────
 def ai_fix_prompt(issue: str, context: str) -> str:
     if not GEMINI_KEY:
         return ""
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_KEY)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        result = model.generate_content(
+        result = genai.GenerativeModel("gemini-2.5-flash").generate_content(
             f"Ты — автоматический ассистент DevOps-бота. На домашнем сервере произошла проблема.\n"
-            f"Проблема: {issue}\n"
-            f"Контекст: {context}\n\n"
+            f"Проблема: {issue}\nКонтекст: {context}\n\n"
             f"Напиши ОДИН короткий промпт (1-3 предложения на русском языке), который владелец "
             f"скопирует и отправит ИИ-девопсу Claude чтобы тот немедленно исправил проблему. "
             f"Включи все технические детали. Выведи ТОЛЬКО текст промпта, без кавычек."
@@ -158,7 +133,7 @@ async def send_alerts(bot, alerts: list[dict]):
             msg += f"\n\n📋 <b>Промпт для Claude:</b>\n<code>{fix}</code>"
         await bot.send_message(ADMIN_ID, msg, parse_mode="HTML")
     else:
-        issue_sum = f"{len(alerts)} проблем одновременно: " + "; ".join(a["issue"] for a in alerts[:4])
+        issue_sum = f"{len(alerts)} проблем: " + "; ".join(a["issue"] for a in alerts[:3])
         ctx_sum   = " | ".join(a["context"] for a in alerts[:3])
         fix = ai_fix_prompt(issue_sum, ctx_sum)
         body = "\n".join(a["text"] for a in alerts)
@@ -173,7 +148,7 @@ def px(path):
         r = requests.get(f"{PX_BASE}{path}", headers=PX_HEADERS, verify=False, timeout=10)
         return r.json().get("data")
     except Exception as e:
-        log.error(f"Proxmox API {path}: {e}")
+        log.error(f"PX API {path}: {e}")
         return None
 
 def node_status(): return px(f"/nodes/{PX_NODE}/status")
@@ -182,7 +157,7 @@ def lxc():         return px(f"/nodes/{PX_NODE}/lxc") or []
 def storages():    return px(f"/nodes/{PX_NODE}/storage") or []
 def backups():     return px("/cluster/backup") or []
 
-def last_backup_age_hours(vmid: int) -> float | None:
+def last_backup_age_hours(vmid):
     data = px(f"/nodes/{PX_NODE}/storage/backup-disk/content?content=backup&vmid={vmid}")
     if not data:
         return None
@@ -191,6 +166,35 @@ def last_backup_age_hours(vmid: int) -> float | None:
         return None
     latest = max(entries, key=lambda x: x.get("ctime", 0))
     return (time.time() - latest["ctime"]) / 3600
+
+def backup_task_results():
+    """Returns list of recent vzdump task results with status OK/ERROR/WARNING."""
+    tasks = px(f"/nodes/{PX_NODE}/tasks?typefilter=vzdump&limit=20") or []
+    results = []
+    for t in tasks:
+        if t.get("endtime") and t.get("status"):
+            results.append({
+                "vmid":      t.get("id", "?"),
+                "status":    t.get("status", ""),
+                "starttime": t.get("starttime", 0),
+                "upid":      t.get("upid", ""),
+            })
+    return results
+
+def pve_temperature():
+    """Get max CPU temperature from PVE via SSH."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-i", "/root/.ssh/id_ed25519", "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=5", f"root@{PX_HOST}",
+             "cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"],
+            capture_output=True, text=True, timeout=8
+        )
+        temps = [int(t) // 1000 for t in r.stdout.split() if t.strip().isdigit() and len(t) >= 4]
+        return max(temps) if temps else None
+    except Exception as e:
+        log.error(f"PVE temp: {e}")
+        return None
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 def docker_client():
@@ -205,39 +209,80 @@ def docker_containers():
     c = docker_client()
     return c.containers.list(all=True) if c else []
 
-# ── SSL cert check ────────────────────────────────────────────────────────────
-def ssl_days_left(hostname: str) -> int | None:
+def docker_volume_sizes():
+    try:
+        import docker
+        df = docker.APIClient().df()
+        vols = []
+        for v in df.get("Volumes") or []:
+            size = v.get("UsageData", {}).get("Size", -1)
+            if size > 0:
+                vols.append({"name": v["Name"], "size": size})
+        return sorted(vols, key=lambda x: x["size"], reverse=True)
+    except Exception as e:
+        log.error(f"Volume sizes: {e}")
+        return []
+
+# ── Coolify discovery ─────────────────────────────────────────────────────────
+_watch_cache: list[str] = []
+_watch_ts: float = 0
+
+def discover_watch_urls() -> list[str]:
+    global _watch_cache, _watch_ts
+    if time.time() - _watch_ts < 300 and _watch_cache:
+        return _watch_cache
+    urls: set[str] = set(WATCH_URLS_EXTRA)
+    hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
+    try:
+        for app in requests.get(f"{COOLIFY_API}/applications", headers=hdrs, timeout=5).json():
+            for part in (app.get("fqdn") or "").split(","):
+                part = part.strip()
+                if WATCH_DOMAIN_FILTER in part and "sslip.io" not in part:
+                    urls.add(part if part.startswith("http") else "https://" + part)
+    except Exception as e:
+        log.error(f"Coolify apps: {e}")
+    try:
+        for svc in requests.get(f"{COOLIFY_API}/services", headers=hdrs, timeout=5).json():
+            for fqdn in re.findall(r"COOLIFY_FQDN:\s*([^\s\n]+)", svc.get("docker_compose", "") or ""):
+                if WATCH_DOMAIN_FILTER in fqdn and "sslip.io" not in fqdn:
+                    urls.add("https://" + fqdn)
+    except Exception as e:
+        log.error(f"Coolify services: {e}")
+    result = sorted(urls)
+    if result:
+        _watch_cache, _watch_ts = result, time.time()
+        log.info(f"Watch URLs: {result}")
+    return result
+
+# ── SSL ───────────────────────────────────────────────────────────────────────
+def ssl_days_left(hostname: str):
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection((hostname, 443), timeout=10) as sock:
             with ctx.wrap_socket(sock, server_hostname=hostname) as s:
-                cert = s.getpeercert()
-                exp = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                exp = datetime.strptime(s.getpeercert()["notAfter"], "%b %d %H:%M:%S %Y %Z")
                 return (exp - datetime.utcnow()).days
     except Exception as e:
         log.error(f"SSL {hostname}: {e}")
         return None
 
-# ── External URL check ────────────────────────────────────────────────────────
-def url_ok(url: str) -> bool:
-    try:
-        r = requests.get(url, timeout=10, allow_redirects=True)
-        return r.status_code < 500
-    except:
-        return False
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def pct(used, total): return used / total * 100 if total else 0
 def fmt_gb(b):        return f"{b/1024**3:.1f}G"
+def fmt_mb(b):        return f"{b/1024**2:.0f}M"
 def uptime_str(s):
     d, rem = divmod(int(s), 86400)
-    h, rem = divmod(rem, 3600)
-    m = rem // 60
+    h, m   = divmod(rem // 60, 60)
     return f"{d}д {h}ч {m}м" if d else f"{h}ч {m}м"
-def vm_icon(st):  return "🟢" if st == "running" else "🔴"
-def b(t):         return f"<b>{t}</b>"
+def vm_icon(st): return "🟢" if st == "running" else "🔴"
+def b(t):        return f"<b>{t}</b>"
+def url_ok(url):
+    try:
+        return requests.get(url, timeout=10, allow_redirects=True).status_code < 500
+    except:
+        return False
 
-# ── Status report ─────────────────────────────────────────────────────────────
+# ── Status ────────────────────────────────────────────────────────────────────
 def build_status():
     lines = [f"📊 {b('Proxmox Monitor')}  {datetime.now().strftime('%d.%m %H:%M')}"]
 
@@ -246,8 +291,10 @@ def build_status():
         cpu  = node["cpu"] * 100
         mem  = pct(node["memory"]["used"], node["memory"]["total"])
         disk = pct(node["rootfs"]["used"], node["rootfs"]["total"])
+        temp = pve_temperature()
+        temp_s = f"  🌡 {temp}°C" if temp else ""
         lines += ["", f"🖥 {b('Node: ' + PX_NODE)}",
-                  f"CPU {cpu:.1f}%  RAM {mem:.1f}%  Disk {disk:.1f}%",
+                  f"CPU {cpu:.1f}%  RAM {mem:.1f}%  Disk {disk:.1f}%{temp_s}",
                   f"Uptime: {uptime_str(node['uptime'])}"]
     else:
         lines += ["", f"🔴 {b('Proxmox недоступен!')}"]
@@ -260,14 +307,12 @@ def build_status():
             lines.append(f"{vm_icon(g['status'])} [{g['vmid']}] {g['name']}  RAM {mem_s}  CPU {g.get('cpu',0)*100:.1f}%")
 
     containers = docker_containers()
-    running = [c for c in containers if c.status == "running"]
     stopped = [c for c in containers if c.status != "running"]
-    if containers:
-        lines += ["", f"🐳 {b('Docker')} ({len(running)}/{len(containers)} running)"]
-        if stopped:
-            for c in sorted(stopped, key=lambda x: x.name):
-                lines.append(f"🔴 {c.name}")
-        lines.append(f"🟢 {len(running)} контейнеров запущено")
+    lines += ["", f"🐳 {b('Docker')} ({len(containers)-len(stopped)}/{len(containers)} running)"]
+    for c in sorted(stopped, key=lambda x: x.name):
+        lines.append(f"🔴 {c.name}")
+    if not stopped:
+        lines.append(f"🟢 Все контейнеры запущены")
 
     stor = storages()
     if stor:
@@ -278,36 +323,83 @@ def build_status():
                 warn = "⚠️ " if p > DISK_WARN else ""
                 lines.append(f"{warn}{s['storage']}: {p:.0f}%  {fmt_gb(s['used'])}/{fmt_gb(s['total'])}")
 
+    # Top volumes
+    vols = [v for v in docker_volume_sizes() if v["size"] > 1024**3][:5]
+    if vols:
+        lines += ["", f"📦 {b('Volumes (топ)')}"]
+        for v in vols:
+            warn = "⚠️ " if v["size"] > VOLUME_WARN_GB * 1024**3 else ""
+            short = v["name"][-40:] if len(v["name"]) > 40 else v["name"]
+            lines.append(f"{warn}{fmt_gb(v['size'])}  {short}")
+
     bkps = backups()
     if bkps:
         lines += ["", f"🗄 {b('Бэкапы')}"]
         for bk in bkps:
             nxt  = datetime.fromtimestamp(bk["next-run"]).strftime("%d.%m %H:%M") if bk.get("next-run") else "—"
             keep = bk.get("prune-backups", {}).get("keep-last", "?")
-            st   = "✅" if bk.get("enabled") else "⏸"
-            lines.append(f"{st} {bk['schedule']}  след: {nxt}  хранить: {keep} шт")
+            lines.append(f"{'✅' if bk.get('enabled') else '⏸'} {bk['schedule']}  след: {nxt}  хранить: {keep}")
         age = last_backup_age_hours(100)
         if age is not None:
-            warn = "⚠️ " if age > BACKUP_MAX_AGE_H else "✅"
-            lines.append(f"{warn} Последний бэкап VM 100: {age:.0f}ч назад")
+            lines.append(f"{'⚠️' if age > BACKUP_MAX_AGE_H else '✅'} Последний бэкап VM 100: {age:.0f}ч назад")
 
-    if discover_watch_urls():
-        watch = discover_watch_urls()
+    watch = discover_watch_urls()
+    if watch:
         lines += ["", f"🌐 {b('Сервисы')} ({len(watch)})"]
         for url in watch:
-            ok = url_ok(url)
-            name = url.replace("https://", "").replace("http://", "").split("/")[0]
+            ok   = url_ok(url)
+            name = url.replace("https://","").replace("http://","").split("/")[0]
             lines.append(f"{'🟢' if ok else '🔴'} {name}")
 
     return "\n".join(lines)
 
-# ── Check functions ───────────────────────────────────────────────────────────
+# ── Weekly trend ──────────────────────────────────────────────────────────────
+def build_weekly_trend(con) -> str:
+    lines = [f"📈 {b('Еженедельный отчёт')}  {datetime.now().strftime('%d.%m.%Y')}"]
+
+    for stor in storages():
+        if stor.get("total", 0) == 0:
+            continue
+        history = get_metric_history(con, f"disk_{stor['storage']}", 7)
+        if len(history) >= 2:
+            oldest_val, newest_val = history[0][1], history[-1][1]
+            delta = newest_val - oldest_val
+            sign  = "+" if delta >= 0 else ""
+            days_until_full = None
+            if delta > 0:
+                rate_per_day = delta / max(len(history) - 1, 1)
+                free = stor["total"] / 1024**3 - newest_val
+                if rate_per_day > 0:
+                    days_until_full = int(free / rate_per_day)
+            until_s = f"  (полный через ~{days_until_full}д)" if days_until_full and days_until_full < 60 else ""
+            lines.append(f"💾 {stor['storage']}: {sign}{delta:.1f}G за неделю{until_s}")
+
+    cpu_hist = get_metric_history(con, "cpu_avg", 7)
+    if len(cpu_hist) >= 3:
+        avg = sum(v for _, v in cpu_hist) / len(cpu_hist)
+        lines.append(f"🖥 CPU среднее за неделю: {avg:.1f}%")
+
+    vols = [v for v in docker_volume_sizes() if v["size"] > 1024**3][:3]
+    if vols:
+        lines.append(f"📦 Топ volumes: " + ", ".join(f"{fmt_gb(v['size'])} {v['name'].split('_')[-1][:20]}" for v in vols))
+
+    return "\n".join(lines)
+
+def record_daily_metrics(con):
+    node = node_status()
+    if node:
+        store_metric(con, "cpu_avg", node["cpu"] * 100)
+    for s in storages():
+        if s.get("total", 0) > 0:
+            store_metric(con, f"disk_{s['storage']}", s["used"] / 1024**3)
+
+# ── Checks ────────────────────────────────────────────────────────────────────
 async def run_checks(bot, con):
     if is_silenced(con):
         return
 
-    alerts    = []
-    recoveries = []
+    backup_window = in_backup_window()
+    alerts, recoveries = [], []
 
     def alert(key, text, issue, context):
         if can_alert(con, key):
@@ -316,151 +408,170 @@ async def run_checks(bot, con):
     def recovery(text):
         recoveries.append(text)
 
+    def threshold(key, name, value, thr, ctx="", suppress_in_backup=False):
+        firing = get_state(con, f"{key}_f") == "1"
+        if value > thr:
+            set_state(con, f"{key}_f", "1")
+            if not (suppress_in_backup and backup_window):
+                alert(key, f"⚠️ {b(name)}: {value:.0f}% (порог {thr}%)", f"{name} = {value:.0f}%", ctx or name)
+        else:
+            if firing:
+                recovery(f"✅ {b(name)} в норме: {value:.0f}%")
+                clear_alert(con, key)
+            set_state(con, f"{key}_f", "0")
+
     # ── Proxmox доступность
     node = node_status()
     px_key = "px_reachable"
     if not node:
         set_state(con, f"{px_key}_f", "1")
-        alert(px_key,
-              f"🔴 {b('Proxmox PVE недоступен!')}",
+        alert(px_key, f"🔴 {b('Proxmox PVE недоступен!')}",
               "Proxmox PVE недоступен через API",
-              f"IP: {PX_HOST}, порт 8006. Возможно завис или сеть упала.")
+              f"IP: {PX_HOST}, порт 8006")
     else:
         if get_state(con, f"{px_key}_f") == "1":
             recovery(f"🟢 {b('Proxmox снова доступен')}")
         set_state(con, f"{px_key}_f", "0")
         clear_alert(con, px_key)
 
-        cpu = node["cpu"] * 100
-        mem = pct(node["memory"]["used"], node["memory"]["total"])
+        threshold("node_cpu", "CPU (PVE)", node["cpu"]*100, CPU_WARN,
+                  f"Proxmox node {PX_NODE}")
+        threshold("node_mem", "RAM (PVE)",
+                  pct(node["memory"]["used"], node["memory"]["total"]), MEM_WARN,
+                  f"RAM: {fmt_gb(node['memory']['used'])}/{fmt_gb(node['memory']['total'])}")
 
-        for metric, val, thr, key in [
-            ("CPU нагрузка (PVE)", cpu, CPU_WARN, "node_cpu"),
-            ("RAM (PVE)",          mem, MEM_WARN, "node_mem"),
-        ]:
-            firing = get_state(con, f"{key}_f") == "1"
-            if val > thr:
-                set_state(con, f"{key}_f", "1")
-                alert(key, f"⚠️ {b(metric)}: {val:.0f}% (порог {thr}%)",
-                      f"{metric} = {val:.0f}%",
-                      f"Proxmox node {PX_NODE}, порог {thr}%")
-            else:
-                if firing:
-                    recovery(f"✅ {b(metric)} в норме: {val:.0f}%")
-                    clear_alert(con, key)
-                set_state(con, f"{key}_f", "0")
+    # ── Температура
+    temp = pve_temperature()
+    if temp is not None:
+        t_key = "pve_temp"
+        firing = get_state(con, f"{t_key}_f") == "1"
+        if temp > TEMP_WARN:
+            set_state(con, f"{t_key}_f", "1")
+            alert(t_key, f"🌡 {b('Температура CPU PVE')}: {temp}°C (порог {TEMP_WARN}°C)",
+                  f"CPU температура PVE = {temp}°C",
+                  f"Intel i5-8500T на Proxmox PVE {PX_HOST}. TjMax=100°C. "
+                  f"Проверь кулер и термопасту.")
+        else:
+            if firing:
+                recovery(f"✅ {b('Температура')} в норме: {temp}°C")
+                clear_alert(con, t_key)
+            set_state(con, f"{t_key}_f", "0")
 
     # ── Диски
     for s in storages():
         if s.get("total", 0) > 0:
-            p   = pct(s["used"], s["total"])
-            key = f"disk_{s['storage']}"
-            firing = get_state(con, f"{key}_f") == "1"
-            if p > DISK_WARN:
-                set_state(con, f"{key}_f", "1")
-                alert(key, f"⚠️ {b('Диск ' + s['storage'])}: {p:.0f}%  {fmt_gb(s['used'])}/{fmt_gb(s['total'])}",
-                      f"Диск {s['storage']} = {p:.0f}%",
+            p = pct(s["used"], s["total"])
+            threshold(f"disk_{s['storage']}", f"Диск {s['storage']}", p, DISK_WARN,
                       f"Storage '{s['storage']}': {fmt_gb(s['used'])} из {fmt_gb(s['total'])}. "
-                      f"{'Хранилище бэкапов — нехватка места не даст сохранить следующий бэкап.' if 'backup' in s['storage'] else ''}")
-            else:
-                if firing:
-                    recovery(f"✅ {b('Диск ' + s['storage'])} в норме: {p:.0f}%")
-                    clear_alert(con, key)
-                set_state(con, f"{key}_f", "0")
+                      f"{'Хранилище бэкапов.' if 'backup' in s['storage'] else ''}")
 
-    # ── Бэкапы
+    # ── Бэкап: возраст
     for vmid in [v["vmid"] for v in vms()]:
         age = last_backup_age_hours(vmid)
         key = f"backup_age_{vmid}"
         firing = get_state(con, f"{key}_f") == "1"
-        if age is None:
+        if age is None or age > BACKUP_MAX_AGE_H:
             set_state(con, f"{key}_f", "1")
-            alert(key, f"⚠️ {b(f'Нет бэкапов VM {vmid}')}",
-                  f"VM {vmid} не имеет ни одного бэкапа на backup-disk",
-                  f"Proxmox PVE, backup-disk storage, VMID {vmid}")
-        elif age > BACKUP_MAX_AGE_H:
-            set_state(con, f"{key}_f", "1")
-            alert(key, f"⚠️ {b(f'Старый бэкап VM {vmid}')}: {age:.0f}ч назад (порог {BACKUP_MAX_AGE_H}ч)",
-                  f"VM {vmid} не бэкапилась {age:.0f} часов",
-                  f"Последний бэкап VM {vmid} на backup-disk был {age:.0f}ч назад. "
-                  f"Норма: каждые {BACKUP_MAX_AGE_H}ч. Возможно диск был полный или задача упала.")
+            msg = (f"⚠️ {b(f'Нет бэкапов VM {vmid}')}" if age is None
+                   else f"⚠️ {b(f'Старый бэкап VM {vmid}')}: {age:.0f}ч назад")
+            alert(key, msg,
+                  f"VM {vmid} не бэкапилась {'вообще' if age is None else f'{age:.0f}ч'}",
+                  f"Proxmox backup-disk, VMID {vmid}, норма: каждые {BACKUP_MAX_AGE_H}ч")
         else:
             if firing:
                 recovery(f"✅ {b(f'Бэкап VM {vmid}')} свежий: {age:.0f}ч назад")
                 clear_alert(con, key)
             set_state(con, f"{key}_f", "0")
 
-    # ── Статус VM
+    # ── Бэкап: результат задачи
+    seen_tasks = set((get_state(con, "seen_backup_tasks") or "").split(","))
+    new_seen = set()
+    for task in backup_task_results():
+        upid = task["upid"]
+        new_seen.add(upid)
+        if upid not in seen_tasks and task["status"] not in ("OK", ""):
+            vmid = task["vmid"]
+            alert(f"backup_task_{upid[:20]}", f"❌ {b(f'Бэкап VM {vmid} завершился с ошибкой')}: {task['status']}",
+                  f"Задача vzdump для VM {vmid} завершилась со статусом {task['status']}",
+                  f"Proxmox task UPID: {upid}. Проверь детали в PVE UI → Tasks.")
+    set_state(con, "seen_backup_tasks", ",".join(new_seen))
+
+    # ── Статус VM (подавляем в окне бэкапа — Proxmox freeze)
     for g in vms() + lxc():
         key  = f"vm_{g['vmid']}"
         prev = get_state(con, key)
         curr = g["status"]
         if prev and prev != curr:
-            if curr != "running":
+            if curr != "running" and not backup_window:
                 alert(f"{key}_chg", f"{vm_icon(curr)} {b(g['name'])} ({g['vmid']}): {prev} → {curr}",
-                      f"VM '{g['name']}' (VMID {g['vmid']}) остановилась: {prev} → {curr}",
-                      f"Proxmox PVE 192.168.0.50, VMID {g['vmid']} ({g['name']}). "
-                      f"{'Это главная VM — все Docker сервисы на ней.' if g['vmid'] == 100 else ''}")
-            else:
+                      f"VM '{g['name']}' изменила статус: {prev} → {curr}",
+                      f"VMID {g['vmid']}, {'главная VM с Docker' if g['vmid']==100 else 'вторичная VM'}.")
+            elif curr == "running":
                 recovery(f"🟢 {b(g['name'])} ({g['vmid']}): снова запущена")
         set_state(con, key, curr)
 
     # ── Docker контейнеры (статус + crash loop)
     for c in docker_containers():
         cid  = c.id[:12]
-        # Статус
         skey = f"docker_{cid}"
         prev = get_state(con, skey)
         curr = c.status
         if prev and prev != curr:
-            if curr != "running":
+            if curr != "running" and not backup_window:
                 alert(f"{skey}_chg", f"🔴 {b(c.name)}: {prev} → {curr}",
                       f"Docker контейнер '{c.name}' упал: {prev} → {curr}",
                       f"docker-core, image: {c.image.tags[0] if c.image.tags else 'unknown'}. "
-                      f"Управление через Coolify API http://localhost:8000/api/v1.")
-            else:
+                      f"Coolify API: http://localhost:8000/api/v1.")
+            elif curr == "running":
                 recovery(f"🟢 {b(c.name)}: снова запущен")
         set_state(con, skey, curr)
 
-        # Crash loop — считаем рестарты
         if curr == "running":
             try:
-                rc   = c.attrs.get("RestartCount", 0)
-                rkey = f"docker_rc_{cid}"
+                rc      = c.attrs.get("RestartCount", 0)
+                rkey    = f"docker_rc_{cid}"
                 prev_rc = int(get_state(con, rkey) or 0)
-                delta   = rc - prev_rc
-                if delta >= CRASH_LOOP_MIN and can_alert(con, f"{rkey}_alert"):
-                    alert(f"{rkey}_alert",
-                          f"🔄 {b(c.name)}: crash loop ({delta} рестартов за цикл, всего {rc})",
-                          f"Контейнер '{c.name}' в crash loop: {delta} рестартов за последний период",
-                          f"docker-core, image: {c.image.tags[0] if c.image.tags else 'unknown'}. "
-                          f"Проверь логи контейнера.")
+                if rc - prev_rc >= CRASH_LOOP_MIN:
+                    alert(f"{rkey}_loop",
+                          f"🔄 {b(c.name)}: crash loop ({rc-prev_rc} рестартов, всего {rc})",
+                          f"Контейнер '{c.name}' в crash loop",
+                          f"docker-core, {rc-prev_rc} рестартов. Image: {c.image.tags[0] if c.image.tags else '?'}")
                 set_state(con, rkey, rc)
             except Exception as e:
-                log.error(f"Crash loop check {c.name}: {e}")
+                log.error(f"Crash loop {c.name}: {e}")
 
-    # ── Внешние сервисы (автодискавери из Coolify)
+    # ── Docker volumes
+    for v in docker_volume_sizes():
+        if v["size"] > VOLUME_WARN_GB * 1024**3:
+            key = f"vol_{v['name'][:30]}"
+            threshold_gb = v["size"] / 1024**3
+            if can_alert(con, key):
+                short = v["name"][-50:]
+                alert(key, f"📦 {b('Большой volume')}: {fmt_gb(v['size'])}  {short}",
+                      f"Docker volume {v['name']} занимает {fmt_gb(v['size'])}",
+                      f"Порог: {VOLUME_WARN_GB}GB. Проверь что данные нужны.")
+                mark_alerted(con, key)
+
+    # ── Внешние сервисы
     for url in discover_watch_urls():
         key    = f"url_{url}"
         firing = get_state(con, f"{key}_f") == "1"
         ok     = url_ok(url)
-        name   = url.replace("https://", "").split("/")[0]
+        name   = url.replace("https://","").replace("http://","").split("/")[0]
         if not ok:
             set_state(con, f"{key}_f", "1")
-            alert(key, f"🔴 {b(name)} недоступен: {url}",
-                  f"Сервис {url} не отвечает (HTTP >= 500 или timeout)",
-                  f"Внешний URL {url}. Cloudflare tunnel может быть упал или контейнер не отвечает.")
+            alert(key, f"🔴 {b(name)} недоступен",
+                  f"Сервис {url} не отвечает",
+                  f"Cloudflare tunnel или контейнер упал. URL: {url}")
         else:
             if firing:
                 recovery(f"🟢 {b(name)}: снова доступен")
                 clear_alert(con, key)
             set_state(con, f"{key}_f", "0")
 
-    # Отправляем алерты (сгруппированно) и восстановления
     for a in alerts:
         mark_alerted(con, a["key"])
     await send_alerts(bot, alerts)
-
     for r in recoveries:
         await bot.send_message(ADMIN_ID, r, parse_mode="HTML")
 
@@ -468,19 +579,17 @@ async def run_ssl_checks(bot, con):
     if is_silenced(con):
         return
     for url in discover_watch_urls():
-        hostname = url.replace("https://", "").replace("http://", "").split("/")[0]
+        hostname = url.replace("https://","").replace("http://","").split("/")[0]
         days = ssl_days_left(hostname)
-        key  = f"ssl_{hostname}"
         if days is None:
             continue
+        key = f"ssl_{hostname}"
         firing = get_state(con, f"{key}_f") == "1"
         if days < SSL_WARN_DAYS:
             set_state(con, f"{key}_f", "1")
             if can_alert(con, key):
-                fix = ai_fix_prompt(
-                    f"SSL сертификат {hostname} истекает через {days} дней",
-                    f"Домен {hostname}, осталось {days} дней. Traefik/Let's Encrypt должен обновлять автоматически."
-                )
+                fix = ai_fix_prompt(f"SSL {hostname} истекает через {days} дней",
+                                    f"Traefik/Let's Encrypt должен обновлять автоматически.")
                 msg = f"⚠️ {b('SSL: ' + hostname)}: истекает через {b(str(days) + ' дней')}"
                 if fix:
                     msg += f"\n\n📋 <b>Промпт для Claude:</b>\n<code>{fix}</code>"
@@ -488,25 +597,9 @@ async def run_ssl_checks(bot, con):
                 mark_alerted(con, key)
         else:
             if firing:
-                await bot.send_message(ADMIN_ID, f"✅ {b('SSL ' + hostname)}: {days} дней до истечения", parse_mode="HTML")
+                await bot.send_message(ADMIN_ID, f"✅ {b('SSL ' + hostname)}: {days} дней", parse_mode="HTML")
                 clear_alert(con, key)
             set_state(con, f"{key}_f", "0")
-
-# ── Job wrappers ──────────────────────────────────────────────────────────────
-def make_check_job(con):
-    async def job(ctx: CallbackContext):
-        await run_checks(ctx.bot, con)
-    return job
-
-def make_daily_job():
-    async def job(ctx: CallbackContext):
-        await ctx.bot.send_message(ADMIN_ID, build_status(), parse_mode="HTML")
-    return job
-
-def make_ssl_job(con):
-    async def job(ctx: CallbackContext):
-        await run_ssl_checks(ctx.bot, con)
-    return job
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -520,21 +613,56 @@ async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Использование: /logs <имя_контейнера>")
         return
-    name = ctx.args[0].lower()
-    containers = docker_containers()
-    found = [c for c in containers if name in c.name.lower()]
+    name  = ctx.args[0].lower()
+    found = [c for c in docker_containers() if name in c.name.lower()]
+    if not found:
+        await update.message.reply_text(f"Контейнер '{name}' не найден.")
+        return
+    try:
+        logs = found[0].logs(tail=40).decode("utf-8", errors="replace").strip() or "(логи пусты)"
+        await update.message.reply_text(
+            f"📋 {b(found[0].name)}:\n\n<code>{logs[-3500:]}</code>", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /restart <имя_контейнера>")
+        return
+    name  = ctx.args[0].lower()
+    found = [c for c in docker_containers() if name in c.name.lower()]
     if not found:
         await update.message.reply_text(f"Контейнер '{name}' не найден.")
         return
     c = found[0]
-    try:
-        logs = c.logs(tail=40).decode("utf-8", errors="replace").strip()
-        if not logs:
-            logs = "(логи пусты)"
-        text = f"📋 {b(c.name)} — последние строки:\n\n<code>{logs[-3500:]}</code>"
-        await update.message.reply_text(text, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, перезапустить", callback_data=f"restart:{c.id[:12]}:{c.name}"),
+        InlineKeyboardButton("❌ Отмена",            callback_data="cancel"),
+    ]])
+    await update.message.reply_text(
+        f"Перезапустить контейнер {b(c.name)}?\nТекущий статус: {c.status}",
+        reply_markup=kb, parse_mode="HTML")
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Отменено")
+        return
+    if query.data.startswith("restart:"):
+        _, cid, cname = query.data.split(":", 2)
+        try:
+            client = docker_client()
+            c = client.containers.get(cid) if client else None
+            if not c:
+                await query.edit_message_text(f"❌ Контейнер не найден")
+                return
+            c.restart(timeout=30)
+            await query.edit_message_text(f"🔄 {b(cname)}: перезапущен", parse_mode="HTML")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Ошибка: {e}")
 
 async def cmd_silence(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -544,55 +672,71 @@ async def cmd_silence(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.args:
         arg = ctx.args[0].lower()
         try:
-            if arg.endswith("h"):
-                duration = int(arg[:-1]) * 3600
-            elif arg.endswith("m"):
-                duration = int(arg[:-1]) * 60
-            else:
-                duration = int(arg) * 3600
+            duration = int(arg[:-1]) * (3600 if arg.endswith("h") else 60)
         except ValueError:
             await update.message.reply_text("Пример: /silence 2h или /silence 30m")
             return
     until = time.time() + duration
     set_state(con, "silence_until", str(until))
-    until_str = datetime.fromtimestamp(until).strftime("%H:%M")
-    await update.message.reply_text(f"🔕 Алерты отключены до {until_str}")
+    await update.message.reply_text(
+        f"🔕 Алерты отключены до {datetime.fromtimestamp(until).strftime('%H:%M')}")
 
 async def cmd_unsilence(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    con = ctx.bot_data["con"]
-    set_state(con, "silence_until", "0")
-    await update.message.reply_text("🔔 Алерты снова включены")
+    set_state(ctx.bot_data["con"], "silence_until", "0")
+    await update.message.reply_text("🔔 Алерты включены")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    text = (
+    await update.message.reply_text(
         f"🤖 {b('Proxmox Monitor Bot')}\n\n"
         f"{b('Команды:')}\n"
         "/status — полный статус сервера\n"
-        "/logs &lt;имя&gt; — последние 40 строк логов контейнера\n"
-        "/silence 2h — отключить алерты на 2 часа (или 30m)\n"
-        "/unsilence — включить алерты обратно\n"
+        "/logs &lt;имя&gt; — последние 40 строк логов\n"
+        "/restart &lt;имя&gt; — перезапустить контейнер\n"
+        "/silence 2h — тишина на 2ч (или 30m)\n"
+        "/unsilence — включить алерты\n"
         "/help — эта справка\n\n"
-        f"{b('Автоматические алерты:')}\n"
-        f"• CPU &gt; {CPU_WARN}% или RAM &gt; {MEM_WARN}% на PVE\n"
-        f"• Любой диск &gt; {DISK_WARN}%\n"
-        f"• Бэкап старше {BACKUP_MAX_AGE_H}ч или отсутствует\n"
-        f"• VM изменила статус\n"
-        f"• Docker контейнер упал\n"
+        f"{b('Алерты (с промптом для Claude):')}\n"
+        f"• CPU &gt;{CPU_WARN}% / RAM &gt;{MEM_WARN}% / Диск &gt;{DISK_WARN}%\n"
+        f"• Температура CPU &gt;{TEMP_WARN}°C\n"
+        f"• Бэкап старше {BACKUP_MAX_AGE_H}ч или завершился с ошибкой\n"
+        f"• VM / Docker контейнер изменил статус\n"
         f"• Crash loop (≥{CRASH_LOOP_MIN} рестартов)\n"
-        f"• Внешний сервис недоступен\n"
-        f"• SSL сертификат истекает &lt; {SSL_WARN_DAYS} дней\n"
-        f"• Proxmox API недоступен\n\n"
+        f"• Docker volume &gt;{VOLUME_WARN_GB}GB\n"
+        f"• Внешний сервис недоступен (авто-список из Coolify)\n"
+        f"• SSL сертификат &lt;{SSL_WARN_DAYS} дней\n\n"
         f"{b('Умное поведение:')}\n"
-        "• Если несколько проблем сразу — одно сгруппированное сообщение\n"
-        "• Каждый алерт содержит готовый промпт для Claude DevOps\n"
-        f"• Повтор алерта не чаще раз в {ALERT_COOLDOWN//60} минут\n"
-        f"• Ежедневный отчёт в {SUMMARY_HOUR}:00"
-    )
-    await update.message.reply_text(text, parse_mode="HTML")
+        f"• Группировка: много проблем = одно сообщение\n"
+        f"• Авто-тишина {BACKUP_WIN_START}:00–{BACKUP_WIN_END}:00 (окно бэкапов)\n"
+        f"• Ежедневный отчёт в {SUMMARY_HOUR}:00\n"
+        f"• Еженедельный тренд по воскресеньям\n"
+        f"• Cooldown алерта: {ALERT_COOLDOWN//60} мин",
+        parse_mode="HTML")
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+def make_check_job(con):
+    async def job(ctx: CallbackContext):
+        await run_checks(ctx.bot, con)
+    return job
+
+def make_daily_job(con):
+    async def job(ctx: CallbackContext):
+        record_daily_metrics(con)
+        await ctx.bot.send_message(ADMIN_ID, build_status(), parse_mode="HTML")
+    return job
+
+def make_ssl_job(con):
+    async def job(ctx: CallbackContext):
+        await run_ssl_checks(ctx.bot, con)
+    return job
+
+def make_weekly_job(con):
+    async def job(ctx: CallbackContext):
+        await ctx.bot.send_message(ADMIN_ID, build_weekly_trend(con), parse_mode="HTML")
+    return job
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
@@ -602,16 +746,20 @@ async def main():
 
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("logs",      cmd_logs))
+    app.add_handler(CommandHandler("restart",   cmd_restart))
     app.add_handler(CommandHandler("silence",   cmd_silence))
     app.add_handler(CommandHandler("unsilence", cmd_unsilence))
     app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     app.job_queue.run_repeating(make_check_job(con), interval=CHECK_INTERVAL, first=10)
-    app.job_queue.run_daily(make_daily_job(),         time=dtime(hour=SUMMARY_HOUR, minute=0))
-    app.job_queue.run_daily(make_ssl_job(con),        time=dtime(hour=SUMMARY_HOUR, minute=5))
+    app.job_queue.run_daily(make_daily_job(con),  time=dtime(hour=SUMMARY_HOUR, minute=0))
+    app.job_queue.run_daily(make_ssl_job(con),    time=dtime(hour=SUMMARY_HOUR, minute=5))
+    app.job_queue.run_daily(make_weekly_job(con), time=dtime(hour=SUMMARY_HOUR, minute=10),
+                            days=(6,))  # воскресенье
 
     await app.initialize()
-    await app.bot.send_message(ADMIN_ID, f"🚀 {b('Proxmox Monitor')} запущен!", parse_mode="HTML")
+    await app.bot.send_message(ADMIN_ID, f"🚀 {b('Proxmox Monitor v2')} запущен!", parse_mode="HTML")
     await app.start()
     await app.updater.start_polling()
     await asyncio.Event().wait()
