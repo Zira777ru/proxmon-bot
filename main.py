@@ -656,6 +656,44 @@ async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Перезапустить контейнер {b(c.name)}?\nТекущий статус: {c.status}",
         reply_markup=kb, parse_mode="HTML")
 
+async def cmd_reboot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    vms = px(f"/nodes/{PX_NODE}/qemu") or []
+    if not vms:
+        await update.message.reply_text("❌ Не удалось получить список VM.")
+        return
+    # Если передан аргумент — ищем VM по имени или vmid
+    if ctx.args:
+        query_str = ctx.args[0].lower()
+        vms = [v for v in vms if str(v.get("vmid","")) == query_str or query_str in v.get("name","").lower()]
+        if not vms:
+            await update.message.reply_text(f"VM '{ctx.args[0]}' не найдена.")
+            return
+        vm = vms[0]
+        vmid, name, status = vm["vmid"], vm.get("name", str(vm["vmid"])), vm.get("status","?")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, перезагрузить", callback_data=f"reboot:{vmid}:{name}"),
+            InlineKeyboardButton("❌ Отмена",             callback_data="cancel"),
+        ]])
+        await update.message.reply_text(
+            f"Перезагрузить VM {b(name)} (VMID {vmid})?\nСтатус: {status}",
+            reply_markup=kb, parse_mode="HTML")
+    else:
+        # Показываем список VM с кнопками
+        running = [v for v in vms if v.get("status") == "running"]
+        if not running:
+            await update.message.reply_text("Нет запущенных VM.")
+            return
+        buttons = [[InlineKeyboardButton(
+            f"{v.get('name', v['vmid'])} (VM {v['vmid']})",
+            callback_data=f"reboot:{v['vmid']}:{v.get('name', v['vmid'])}"
+        )] for v in running]
+        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+        await update.message.reply_text(
+            "Выбери VM для перезагрузки:",
+            reply_markup=InlineKeyboardMarkup(buttons))
+
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -672,6 +710,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             c.restart(timeout=30)
             await query.edit_message_text(f"🔄 {b(cname)}: перезапущен", parse_mode="HTML")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Ошибка: {e}")
+    if query.data.startswith("reboot:"):
+        _, vmid, name = query.data.split(":", 2)
+        try:
+            r = requests.post(f"{PX_BASE}/nodes/{PX_NODE}/qemu/{vmid}/status/reboot",
+                              headers=PX_HEADERS, verify=False, timeout=10)
+            if r.ok:
+                await query.edit_message_text(f"🔄 VM {b(name)} перезагружается...", parse_mode="HTML")
+            else:
+                await query.edit_message_text(f"❌ Ошибка Proxmox API: {r.status_code} {r.text[:100]}")
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
 
@@ -706,7 +755,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{b('Команды:')}\n"
         "/status — полный статус сервера\n"
         "/logs &lt;имя&gt; — последние 40 строк логов\n"
-        "/restart &lt;имя&gt; — перезапустить контейнер\n"
+        "/restart &lt;имя&gt; — перезапустить Docker контейнер\n"
+        "/reboot [vmid|имя] — перезагрузить VM (без аргумента — список)\n"
         "/silence 2h — тишина на 2ч (или 30m)\n"
         "/unsilence — включить алерты\n"
         "/help — эта справка\n\n"
@@ -758,6 +808,7 @@ async def main():
     app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CommandHandler("logs",      cmd_logs))
     app.add_handler(CommandHandler("restart",   cmd_restart))
+    app.add_handler(CommandHandler("reboot",    cmd_reboot))
     app.add_handler(CommandHandler("silence",   cmd_silence))
     app.add_handler(CommandHandler("unsilence", cmd_unsilence))
     app.add_handler(CommandHandler("help",      cmd_help))
