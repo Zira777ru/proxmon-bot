@@ -73,7 +73,7 @@ def ai_fix_prompt(issue: str, context: str) -> str:
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_KEY)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         result = model.generate_content(
             f"Ты — автоматический ассистент DevOps-бота. На домашнем сервере произошла проблема.\n"
             f"Проблема: {issue}\n"
