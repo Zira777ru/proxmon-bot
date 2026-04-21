@@ -9,7 +9,6 @@ import requests
 import urllib3
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -24,6 +23,7 @@ PX_TOKEN_NAME  = os.getenv("PROXMOX_TOKEN_NAME", "proxmon-bot")
 PX_TOKEN_VALUE = os.getenv("PROXMOX_TOKEN_VALUE", "")
 TG_TOKEN       = os.getenv("TG_TOKEN", "")
 ADMIN_ID       = int(os.getenv("ADMIN_TG_ID", "0"))
+GEMINI_KEY     = os.getenv("GEMINI_KEY", "")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 CPU_WARN       = int(os.getenv("CPU_WARN", "85"))
 MEM_WARN       = int(os.getenv("MEM_WARN", "90"))
@@ -65,6 +65,34 @@ def mark_alerted(con, key):
 def clear_alert(con, key):
     con.execute("DELETE FROM alerts WHERE key=?", (key,))
     con.commit()
+
+# ── Gemini AI — только при алерте ────────────────────────────────────────────
+def ai_fix_prompt(issue: str, context: str) -> str:
+    if not GEMINI_KEY:
+        return ""
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_KEY)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        result = model.generate_content(
+            f"Ты — автоматический ассистент DevOps-бота. На домашнем сервере произошла проблема.\n"
+            f"Проблема: {issue}\n"
+            f"Контекст: {context}\n\n"
+            f"Напиши ОДИН короткий промпт (1-3 предложения на русском языке), который владелец сервера "
+            f"скопирует и отправит ИИ-девопсу по имени Claude чтобы тот немедленно исправил проблему. "
+            f"Промпт должен содержать все нужные технические детали. "
+            f"Выведи ТОЛЬКО текст промпта, без кавычек и пояснений."
+        )
+        return result.text.strip()
+    except Exception as e:
+        log.error(f"Gemini: {e}")
+        return ""
+
+def fmt_alert(title: str, fix_prompt: str) -> str:
+    msg = title
+    if fix_prompt:
+        msg += f"\n\n📋 <b>Промпт для Claude:</b>\n<code>{fix_prompt}</code>"
+    return msg
 
 # ── Proxmox API ───────────────────────────────────────────────────────────────
 def px(path):
@@ -117,7 +145,7 @@ def build_status():
             f"Uptime: {uptime_str(node['uptime'])}",
         ]
     else:
-        lines += ["", "🔴 " + b("Proxmox недоступен!")]
+        lines += ["", f"🔴 {b('Proxmox недоступен!')}"]
 
     all_guests = sorted(vms() + lxc(), key=lambda x: x["vmid"])
     if all_guests:
@@ -155,12 +183,20 @@ def build_status():
     return "\n".join(lines)
 
 # ── Alert checks ──────────────────────────────────────────────────────────────
-async def check_threshold(bot, con, key, name, value, threshold):
+async def check_threshold(bot, con, key, name, value, threshold, context=""):
     firing = get_state(con, f"{key}_f") == "1"
     if value > threshold:
         set_state(con, f"{key}_f", "1")
         if can_alert(con, key):
-            await bot.send_message(ADMIN_ID, f"⚠️ {b(name)}: {value:.0f}% (порог {threshold}%)", parse_mode="HTML")
+            fix = ai_fix_prompt(
+                f"{name} = {value:.0f}% (порог {threshold}%)",
+                context or f"Сервер: docker-core / Proxmox PVE"
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                fmt_alert(f"⚠️ {b(name)}: {value:.0f}% (порог {threshold}%)", fix),
+                parse_mode="HTML"
+            )
             mark_alerted(con, key)
     else:
         if firing:
@@ -169,11 +205,16 @@ async def check_threshold(bot, con, key, name, value, threshold):
         set_state(con, f"{key}_f", "0")
 
 async def run_checks(bot, con):
+    # Proxmox доступность
     node = node_status()
     px_key = "px_reachable"
     if not node:
         if can_alert(con, px_key):
-            await bot.send_message(ADMIN_ID, f"🔴 {b('Proxmox недоступен!')}", parse_mode="HTML")
+            fix = ai_fix_prompt(
+                "Proxmox PVE недоступен через API",
+                "IP: 192.168.0.50, порт 8006. Возможно PVE завис или сеть недоступна."
+            )
+            await bot.send_message(ADMIN_ID, fmt_alert(f"🔴 {b('Proxmox недоступен!')}", fix), parse_mode="HTML")
             mark_alerted(con, px_key)
         return
     else:
@@ -182,28 +223,59 @@ async def run_checks(bot, con):
         set_state(con, f"{px_key}_f", "0")
         clear_alert(con, px_key)
 
-    await check_threshold(bot, con, "node_cpu", "CPU нагрузка (PVE)", node["cpu"] * 100, CPU_WARN)
-    await check_threshold(bot, con, "node_mem", "RAM (PVE)", pct(node["memory"]["used"], node["memory"]["total"]), MEM_WARN)
+    # Ресурсы ноды
+    await check_threshold(bot, con, "node_cpu", "CPU нагрузка (PVE)",
+        node["cpu"] * 100, CPU_WARN,
+        f"Proxmox node pve, текущий CPU: {node['cpu']*100:.1f}%")
 
+    await check_threshold(bot, con, "node_mem", "RAM (PVE)",
+        pct(node["memory"]["used"], node["memory"]["total"]), MEM_WARN,
+        f"RAM used: {fmt_gb(node['memory']['used'])} / {fmt_gb(node['memory']['total'])}")
+
+    # Диски
     for s in storages():
         if s.get("total", 0) > 0:
-            await check_threshold(bot, con, f"disk_{s['storage']}", f"Диск {s['storage']}", pct(s["used"], s["total"]), DISK_WARN)
+            p = pct(s["used"], s["total"])
+            await check_threshold(bot, con, f"disk_{s['storage']}", f"Диск {s['storage']}", p, DISK_WARN,
+                f"Storage '{s['storage']}': {fmt_gb(s['used'])} использовано из {fmt_gb(s['total'])}. "
+                f"Это хранилище для {'бэкапов VM' if 'backup' in s['storage'] else 'данных'}.")
 
+    # Статус VM
     for g in vms() + lxc():
         key  = f"vm_{g['vmid']}"
         prev = get_state(con, key)
         curr = g["status"]
         if prev and prev != curr:
-            await bot.send_message(ADMIN_ID, f"{vm_icon(curr)} {b(g['name'])} ({g['vmid']}): {prev} → {curr}", parse_mode="HTML")
+            fix = ai_fix_prompt(
+                f"VM '{g['name']}' (VMID {g['vmid']}) изменила статус: {prev} → {curr}",
+                f"Proxmox PVE 192.168.0.50, VM {g['vmid']} ({g['name']}), "
+                f"{'это главная VM с Docker и всеми сервисами' if g['vmid']==100 else 'вторичная VM'}."
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                fmt_alert(f"{vm_icon(curr)} {b(g['name'])} ({g['vmid']}): {prev} → {curr}", fix),
+                parse_mode="HTML"
+            )
         set_state(con, key, curr)
 
+    # Статус Docker контейнеров
     for c in docker_containers():
         key  = f"docker_{c.id[:12]}"
         prev = get_state(con, key)
         curr = c.status
-        if prev and prev != curr:
-            icon = "🟢" if curr == "running" else "🔴"
-            await bot.send_message(ADMIN_ID, f"{icon} {b(c.name)}: {prev} → {curr}", parse_mode="HTML")
+        if prev and prev != curr and curr != "running":
+            fix = ai_fix_prompt(
+                f"Docker контейнер '{c.name}' упал: {prev} → {curr}",
+                f"Контейнер на docker-core. Image: {c.image.tags[0] if c.image.tags else 'unknown'}. "
+                f"Все сервисы управляются через Coolify (http://localhost:8000/api/v1)."
+            )
+            await bot.send_message(
+                ADMIN_ID,
+                fmt_alert(f"🔴 {b(c.name)}: {prev} → {curr}", fix),
+                parse_mode="HTML"
+            )
+        elif prev and prev != curr and curr == "running":
+            await bot.send_message(ADMIN_ID, f"🟢 {b(c.name)}: снова запущен", parse_mode="HTML")
         set_state(con, key, curr)
 
 # ── PTB job wrappers ──────────────────────────────────────────────────────────
@@ -230,11 +302,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🤖 {b('Proxmox Monitor Bot')}\n\n"
         "/status — полный статус сервера\n"
         "/help — справка\n\n"
-        "Автоматические уведомления:\n"
+        f"Авто-уведомления + промпт для Claude если что-то сломается:\n"
         f"• CPU &gt; {CPU_WARN}% или RAM &gt; {MEM_WARN}%\n"
         f"• Диск &gt; {DISK_WARN}%\n"
         "• VM запустилась / остановилась\n"
-        "• Docker контейнер упал / поднялся\n"
+        "• Docker контейнер упал\n"
         "• Proxmox недоступен\n"
         f"• Ежедневный отчёт в {SUMMARY_HOUR}:00",
         parse_mode="HTML"
