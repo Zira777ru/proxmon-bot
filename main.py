@@ -168,17 +168,25 @@ def last_backup_age_hours(vmid):
     return (time.time() - latest["ctime"]) / 3600
 
 def backup_task_results():
-    """Returns list of recent vzdump task results with status OK/ERROR/WARNING."""
-    tasks = px(f"/nodes/{PX_NODE}/tasks?typefilter=vzdump&limit=20") or []
+    """Returns list of vzdump task results that finished within the last 2 check intervals."""
+    tasks = px(f"/nodes/{PX_NODE}/tasks?typefilter=vzdump&limit=50") or []
+    cutoff = time.time() - max(CHECK_INTERVAL * 2, 300)
     results = []
     for t in tasks:
-        if t.get("endtime") and t.get("status"):
-            results.append({
-                "vmid":      t.get("id", "?"),
-                "status":    t.get("status", ""),
-                "starttime": t.get("starttime", 0),
-                "upid":      t.get("upid", ""),
-            })
+        if not t.get("endtime") or not t.get("status"):
+            continue
+        if t["endtime"] < cutoff:
+            continue
+        upid = t.get("upid", "")
+        # UPID format: UPID:node:pid:pstart:starttime:type:vmid:user:
+        parts = upid.split(":")
+        vmid = parts[6] if len(parts) > 6 and parts[6] else t.get("id", "?")
+        results.append({
+            "vmid":    vmid,
+            "status":  t.get("status", ""),
+            "endtime": t["endtime"],
+            "upid":    upid,
+        })
     return results
 
 def pve_temperature():
@@ -483,18 +491,21 @@ async def run_checks(bot, con):
                 clear_alert(con, key)
             set_state(con, f"{key}_f", "0")
 
-    # ── Бэкап: результат задачи
-    seen_tasks = set((get_state(con, "seen_backup_tasks") or "").split(","))
-    new_seen = set()
+    # ── Бэкап: результат задачи (только задачи завершившиеся в последние 2*CHECK_INTERVAL сек)
+    alerted_tasks = set((get_state(con, "alerted_backup_tasks") or "").split(","))
+    new_alerted = set()
     for task in backup_task_results():
         upid = task["upid"]
-        new_seen.add(upid)
-        if upid not in seen_tasks and task["status"] not in ("OK", ""):
+        if task["status"] not in ("OK", "") and upid not in alerted_tasks:
             vmid = task["vmid"]
+            new_alerted.add(upid)
             alert(f"backup_task_{upid[:20]}", f"❌ {b(f'Бэкап VM {vmid} завершился с ошибкой')}: {task['status']}",
-                  f"Задача vzdump для VM {vmid} завершилась со статусом {task['status']}",
+                  f"Задача vzdump для VM {vmid} завершилась со статусом '{task['status']}'",
                   f"Proxmox task UPID: {upid}. Проверь детали в PVE UI → Tasks.")
-    set_state(con, "seen_backup_tasks", ",".join(new_seen))
+    if new_alerted:
+        combined = (alerted_tasks | new_alerted) - {""}
+        # Храним только последние 50 UPID чтобы строка не росла бесконечно
+        set_state(con, "alerted_backup_tasks", ",".join(list(combined)[-50:]))
 
     # ── Статус VM (подавляем в окне бэкапа — Proxmox freeze)
     for g in vms() + lxc():
