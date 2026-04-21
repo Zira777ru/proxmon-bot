@@ -36,10 +36,59 @@ DB_PATH             = os.getenv("DB_PATH", "/data/monitor.db")
 BACKUP_MAX_AGE_H    = int(os.getenv("BACKUP_MAX_AGE_HOURS", "25"))
 CRASH_LOOP_MIN      = int(os.getenv("CRASH_LOOP_MIN_RESTARTS", "3"))
 SSL_WARN_DAYS       = int(os.getenv("SSL_WARN_DAYS", "14"))
-WATCH_URLS          = [u.strip() for u in os.getenv("WATCH_URLS", "").split(",") if u.strip()]
+WATCH_URLS_EXTRA    = [u.strip() for u in os.getenv("WATCH_URLS", "").split(",") if u.strip()]
+COOLIFY_API         = os.getenv("COOLIFY_API_URL", "http://host.docker.internal:8000/api/v1")
+COOLIFY_TOKEN       = os.getenv("COOLIFY_API_TOKEN", "")
+WATCH_DOMAIN_FILTER = os.getenv("WATCH_DOMAIN_FILTER", "coscore.us")
 
 PX_BASE    = f"https://{PX_HOST}:8006/api2/json"
 PX_HEADERS = {"Authorization": f"PVEAPIToken={PX_USER}!{PX_TOKEN_NAME}={PX_TOKEN_VALUE}"}
+
+# ── Coolify auto-discovery ────────────────────────────────────────────────────
+_watch_urls_cache: list[str] = []
+_watch_urls_ts: float = 0
+WATCH_CACHE_TTL = 300  # 5 min
+
+def discover_watch_urls() -> list[str]:
+    global _watch_urls_cache, _watch_urls_ts
+    if time.time() - _watch_urls_ts < WATCH_CACHE_TTL and _watch_urls_cache:
+        return _watch_urls_cache
+
+    urls: set[str] = set(WATCH_URLS_EXTRA)
+    hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
+
+    try:
+        # Applications
+        r = requests.get(f"{COOLIFY_API}/applications", headers=hdrs, timeout=5)
+        for app in r.json():
+            fqdn = app.get("fqdn", "") or ""
+            for part in fqdn.split(","):
+                part = part.strip()
+                if WATCH_DOMAIN_FILTER in part and "sslip.io" not in part:
+                    if not part.startswith("http"):
+                        part = "https://" + part
+                    urls.add(part)
+    except Exception as e:
+        log.error(f"Coolify apps discovery: {e}")
+
+    try:
+        # Services — extract COOLIFY_FQDN from compose env
+        import re
+        r = requests.get(f"{COOLIFY_API}/services", headers=hdrs, timeout=5)
+        for svc in r.json():
+            compose = svc.get("docker_compose", "") or ""
+            for fqdn in re.findall(r"COOLIFY_FQDN:\s*([^\s\n]+)", compose):
+                if WATCH_DOMAIN_FILTER in fqdn and "sslip.io" not in fqdn:
+                    urls.add("https://" + fqdn)
+    except Exception as e:
+        log.error(f"Coolify services discovery: {e}")
+
+    result = sorted(urls)
+    if result:
+        _watch_urls_cache = result
+        _watch_urls_ts = time.time()
+        log.info(f"Discovered {len(result)} watch URLs: {result}")
+    return result
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 def init_db():
@@ -242,9 +291,10 @@ def build_status():
             warn = "⚠️ " if age > BACKUP_MAX_AGE_H else "✅"
             lines.append(f"{warn} Последний бэкап VM 100: {age:.0f}ч назад")
 
-    if WATCH_URLS:
-        lines += ["", f"🌐 {b('Сервисы')}"]
-        for url in WATCH_URLS:
+    if discover_watch_urls():
+        watch = discover_watch_urls()
+        lines += ["", f"🌐 {b('Сервисы')} ({len(watch)})"]
+        for url in watch:
             ok = url_ok(url)
             name = url.replace("https://", "").replace("http://", "").split("/")[0]
             lines.append(f"{'🟢' if ok else '🔴'} {name}")
@@ -389,8 +439,8 @@ async def run_checks(bot, con):
             except Exception as e:
                 log.error(f"Crash loop check {c.name}: {e}")
 
-    # ── Внешние сервисы
-    for url in WATCH_URLS:
+    # ── Внешние сервисы (автодискавери из Coolify)
+    for url in discover_watch_urls():
         key    = f"url_{url}"
         firing = get_state(con, f"{key}_f") == "1"
         ok     = url_ok(url)
@@ -417,7 +467,7 @@ async def run_checks(bot, con):
 async def run_ssl_checks(bot, con):
     if is_silenced(con):
         return
-    for url in WATCH_URLS:
+    for url in discover_watch_urls():
         hostname = url.replace("https://", "").replace("http://", "").split("/")[0]
         days = ssl_days_left(hostname)
         key  = f"ssl_{hostname}"
