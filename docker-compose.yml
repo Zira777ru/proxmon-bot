@@ -10,6 +10,7 @@ services:
       - /home/igor/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
       - /home/igor/.ssh/known_hosts:/root/.ssh/known_hosts:ro
     environment:
+      - TZ=Europe/Moscow
       - PROXMOX_HOST=192.168.0.50
       - PROXMOX_NODE=pve
       - PROXMOX_USER=root@pam
@@ -23,7 +24,7 @@ services:
       - CRASH_LOOP_MIN_RESTARTS=3
       - SSL_WARN_DAYS=14
       - VOLUME_WARN_GB=10
-      - SUMMARY_HOUR=9
+      - SUMMARY_HOUR=10
       - ALERT_COOLDOWN=1800
       - DB_PATH=/data/monitor.db
       - BACKUP_WINDOW_START=2

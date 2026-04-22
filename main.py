@@ -563,18 +563,24 @@ async def run_checks(bot, con):
                       f"Порог: {VOLUME_WARN_GB}GB. Проверь что данные нужны.")
                 mark_alerted(con, key)
 
-    # ── Внешние сервисы
+    # ── Внешние сервисы (double-check: 2 подряд неудачи → алерт)
     for url in discover_watch_urls():
-        key    = f"url_{url}"
-        firing = get_state(con, f"{key}_f") == "1"
-        ok     = url_ok(url)
-        name   = url.replace("https://","").replace("http://","").split("/")[0]
+        key     = f"url_{url}"
+        firing  = get_state(con, f"{key}_f") == "1"
+        pending = get_state(con, f"{key}_p") == "1"
+        ok      = url_ok(url)
+        name    = url.replace("https://","").replace("http://","").split("/")[0]
         if not ok:
-            set_state(con, f"{key}_f", "1")
-            alert(key, f"🔴 {b(name)} недоступен",
-                  f"Сервис {url} не отвечает",
-                  f"Cloudflare tunnel или контейнер упал. URL: {url}")
+            if pending:
+                set_state(con, f"{key}_f", "1")
+                set_state(con, f"{key}_p", "0")
+                alert(key, f"🔴 {b(name)} недоступен",
+                      f"Сервис {url} не отвечает",
+                      f"Cloudflare tunnel или контейнер упал. URL: {url}")
+            else:
+                set_state(con, f"{key}_p", "1")
         else:
+            set_state(con, f"{key}_p", "0")
             if firing:
                 recovery(f"🟢 {b(name)}: снова доступен")
                 clear_alert(con, key)
