@@ -359,7 +359,22 @@ def build_status():
             name = url.replace("https://","").replace("http://","").split("/")[0]
             lines.append(f"{'🟢' if ok else '🔴'} {name}")
 
-    return "\n".join(lines)
+    # Inline keyboard
+    kb_rows = []
+    kb_rows.append([InlineKeyboardButton("🐳 Список контейнеров", callback_data="docker_list")])
+    if watch:
+        svc_names = [url.replace("https://","").replace("http://","").split("/")[0] for url in watch]
+        row = []
+        for name in svc_names:
+            short = name.split(".")[0][:12]
+            row.append(InlineKeyboardButton(short, callback_data=f"svc_logs:{name}"[:64]))
+            if len(row) == 3:
+                kb_rows.append(row)
+                row = []
+        if row:
+            kb_rows.append(row)
+
+    return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
 
 # ── Weekly trend ──────────────────────────────────────────────────────────────
 def build_weekly_trend(con) -> str:
@@ -622,7 +637,8 @@ async def run_ssl_checks(bot, con):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text(build_status(), parse_mode="HTML")
+    text, kb = build_status()
+    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
 
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -700,12 +716,77 @@ async def cmd_reboot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Выбери VM для перезагрузки:",
             reply_markup=InlineKeyboardMarkup(buttons))
 
+def _container_logs(name_hint: str, tail: int = 40) -> str:
+    try:
+        client = docker_client()
+        if not client:
+            return "❌ Docker недоступен"
+        all_c = client.containers.list(all=True)
+        matched = [c for c in all_c if name_hint.lower() in c.name.lower()]
+        if not matched:
+            return f"❌ Контейнер с '{name_hint}' не найден"
+        c = matched[0]
+        logs = c.logs(tail=tail, timestamps=False).decode("utf-8", errors="replace")
+        return f"📋 <b>{c.name}</b>\n<pre>{logs[-3500:]}</pre>"
+    except Exception as e:
+        return f"❌ Ошибка: {e}"
+
+
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
         await query.edit_message_text("❌ Отменено")
         return
+
+    if query.data == "docker_list":
+        try:
+            client = docker_client()
+            containers = client.containers.list(all=True) if client else []
+            running = [c for c in containers if c.status == "running"]
+            stopped = [c for c in containers if c.status != "running"]
+            lines = [f"🐳 <b>Docker контейнеры</b> ({len(running)}/{len(containers)})"]
+            rows = []
+            for c in sorted(running, key=lambda x: x.name):
+                short = c.name[:30]
+                lines.append(f"🟢 {short}")
+                rows.append([InlineKeyboardButton(f"📋 {c.name[:25]}", callback_data=f"ctr_logs:{c.id[:12]}")])
+            for c in sorted(stopped, key=lambda x: x.name):
+                short = c.name[:30]
+                lines.append(f"🔴 {short}")
+                rows.append([InlineKeyboardButton(f"📋 {c.name[:25]}", callback_data=f"ctr_logs:{c.id[:12]}")])
+            rows.append([InlineKeyboardButton("« Назад", callback_data="back_status")])
+            await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Ошибка: {e}")
+        return
+
+    if query.data.startswith("svc_logs:"):
+        hostname = query.data.split(":", 1)[1]
+        subdomain = hostname.split(".")[0]
+        msg = _container_logs(subdomain)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back_status")]])
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if query.data.startswith("ctr_logs:"):
+        cid = query.data.split(":", 1)[1]
+        try:
+            client = docker_client()
+            c = client.containers.get(cid)
+            logs = c.logs(tail=40, timestamps=False).decode("utf-8", errors="replace")
+            msg = f"📋 <b>{c.name}</b>\n<pre>{logs[-3500:]}</pre>"
+        except Exception as e:
+            msg = f"❌ Ошибка: {e}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Список", callback_data="docker_list")]])
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if query.data == "back_status":
+        text, kb = build_status()
+        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+        return
+
     if query.data.startswith("restart:"):
         _, cid, cname = query.data.split(":", 2)
         try:
@@ -792,7 +873,8 @@ def make_check_job(con):
 def make_daily_job(con):
     async def job(ctx: CallbackContext):
         record_daily_metrics(con)
-        await ctx.bot.send_message(ADMIN_ID, build_status(), parse_mode="HTML")
+        text, kb = build_status()
+        await ctx.bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode="HTML")
     return job
 
 def make_ssl_job(con):
