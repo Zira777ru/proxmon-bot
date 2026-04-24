@@ -785,13 +785,16 @@ async def cmd_reboot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Выбери VM для перезагрузки:",
             reply_markup=InlineKeyboardMarkup(buttons))
 
-def _container_logs(name_hint: str, tail: int = 40) -> str:
+def _container_logs(name_hint: str, tail: int = 40, uuid_hint: str = "") -> str:
     try:
         client = docker_client()
         if not client:
             return "❌ Docker недоступен"
         all_c = client.containers.list(all=True)
+        # Ищем по имени, затем по UUID Coolify
         matched = [c for c in all_c if name_hint.lower() in c.name.lower()]
+        if not matched and uuid_hint:
+            matched = [c for c in all_c if uuid_hint.lower() in c.name.lower()]
         if not matched:
             return f"❌ Контейнер с '{name_hint}' не найден"
         c = matched[0]
@@ -833,7 +836,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if query.data.startswith("svc_logs:"):
         hostname = query.data.split(":", 1)[1]
         subdomain = hostname.split(".")[0]
-        msg = _container_logs(subdomain)
+        # Ищем UUID Coolify по hostname для поиска контейнера по UUID
+        apps = _coolify_apps_map()
+        uuid_hint = apps.get(hostname, {}).get("uuid", "")
+        msg = _container_logs(subdomain, uuid_hint=uuid_hint)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back_status")]])
         await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
         return
