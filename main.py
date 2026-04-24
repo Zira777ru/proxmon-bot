@@ -45,6 +45,7 @@ WATCH_URLS_EXTRA    = [u.strip() for u in os.getenv("WATCH_URLS", "").split(",")
 COOLIFY_API         = os.getenv("COOLIFY_API_URL", "http://host.docker.internal:8000/api/v1")
 COOLIFY_TOKEN       = os.getenv("COOLIFY_API_TOKEN", "")
 WATCH_DOMAIN_FILTER = os.getenv("WATCH_DOMAIN_FILTER", "coscore.us")
+GITHUB_TOKEN        = os.getenv("GITHUB_TOKEN", "")
 
 PX_BASE    = f"https://{PX_HOST}:8006/api2/json"
 PX_HEADERS = {"Authorization": f"PVEAPIToken={PX_USER}!{PX_TOKEN_NAME}={PX_TOKEN_VALUE}"}
@@ -262,6 +263,68 @@ def discover_watch_urls() -> list[str]:
         log.info(f"Watch URLs: {result}")
     return result
 
+# ── GitHub update checks ──────────────────────────────────────────────────────
+def _gh_latest_sha(repo: str, branch: str) -> str | None:
+    """Return latest commit SHA for repo/branch via GitHub API."""
+    if not GITHUB_TOKEN:
+        return None
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/commits/{branch}",
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.sha"},
+            timeout=10,
+        )
+        return r.text.strip() if r.ok else None
+    except Exception as e:
+        log.warning(f"GitHub API {repo}: {e}")
+        return None
+
+
+def _coolify_apps_map() -> dict:
+    """Returns {normalized_fqdn: {uuid, name, repo, branch}} for apps with git repos."""
+    result = {}
+    hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
+    try:
+        for app in requests.get(f"{COOLIFY_API}/applications", headers=hdrs, timeout=5).json():
+            repo = app.get("git_repository", "")
+            if not repo:
+                continue
+            # Strip https://github.com/ prefix if present
+            repo = repo.replace("https://github.com/", "").replace("git@github.com:", "").rstrip(".git")
+            for part in (app.get("fqdn") or "").split(","):
+                part = part.strip().replace("https://", "").replace("http://", "").rstrip("/")
+                if part:
+                    result[part] = {
+                        "uuid": app["uuid"],
+                        "name": app.get("name", ""),
+                        "repo": repo,
+                        "branch": app.get("git_branch", "master"),
+                    }
+    except Exception as e:
+        log.error(f"Coolify apps map: {e}")
+    return result
+
+
+def check_github_updates(con) -> dict:
+    """Returns {fqdn: app_info} for apps that have new commits since last stored SHA."""
+    if not GITHUB_TOKEN:
+        return {}
+    apps = _coolify_apps_map()
+    updates = {}
+    for fqdn, info in apps.items():
+        sha_key = f"gh_sha:{info['uuid']}"
+        latest = _gh_latest_sha(info["repo"], info["branch"])
+        if not latest:
+            continue
+        stored = get_state(con, sha_key)
+        if stored is None:
+            # First time — store baseline, no update shown
+            set_state(con, sha_key, latest)
+        elif stored != latest:
+            updates[fqdn] = {**info, "new_sha": latest}
+    return updates
+
+
 # ── SSL ───────────────────────────────────────────────────────────────────────
 def ssl_days_left(hostname: str):
     try:
@@ -291,7 +354,7 @@ def url_ok(url):
         return False
 
 # ── Status ────────────────────────────────────────────────────────────────────
-def build_status():
+def build_status(con=None):
     lines = [f"📊 {b('Proxmox Monitor')}  {datetime.now().strftime('%d.%m %H:%M')}"]
 
     node = node_status()
@@ -351,13 +414,17 @@ def build_status():
         if age is not None:
             lines.append(f"{'⚠️' if age > BACKUP_MAX_AGE_H else '✅'} Последний бэкап VM 100: {age:.0f}ч назад")
 
+    gh_updates = check_github_updates(con) if con else {}
+
     watch = discover_watch_urls()
     if watch:
         lines += ["", f"🌐 {b('Сервисы')} ({len(watch)})"]
         for url in watch:
             ok   = url_ok(url)
             name = url.replace("https://","").replace("http://","").split("/")[0]
-            lines.append(f"{'🟢' if ok else '🔴'} {name}")
+            has_update = name in gh_updates
+            upd_mark = " ⬆️" if has_update else ""
+            lines.append(f"{'🟢' if ok else '🔴'} {name}{upd_mark}")
 
     # Inline keyboard
     kb_rows = []
@@ -366,8 +433,10 @@ def build_status():
         svc_names = [url.replace("https://","").replace("http://","").split("/")[0] for url in watch]
         row = []
         for name in svc_names:
-            short = name.split(".")[0][:12]
-            row.append(InlineKeyboardButton(short, callback_data=f"svc_logs:{name}"[:64]))
+            has_update = name in gh_updates
+            label = f"⬆️{name.split('.')[0][:10]}" if has_update else name.split(".")[0][:12]
+            cb = f"deploy_update:{gh_updates[name]['uuid']}" if has_update else f"svc_logs:{name}"
+            row.append(InlineKeyboardButton(label, callback_data=cb[:64]))
             if len(row) == 3:
                 kb_rows.append(row)
                 row = []
@@ -637,7 +706,7 @@ async def run_ssl_checks(bot, con):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    text, kb = build_status()
+    text, kb = build_status(ctx.bot_data.get("con"))
     await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
 
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -783,8 +852,32 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if query.data == "back_status":
-        text, kb = build_status()
+        text, kb = build_status(ctx.bot_data.get("con"))
         await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    if query.data.startswith("deploy_update:"):
+        app_uuid = query.data.split(":", 1)[1]
+        await query.edit_message_text(f"🚀 Запускаю деплой...", parse_mode="HTML")
+        try:
+            hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
+            r = requests.post(f"{COOLIFY_API}/applications/{app_uuid}/start", headers=hdrs, timeout=10)
+            deploy_uuid = r.json().get("deployment_uuid", "")
+            # Обновляем stored SHA → latest (чтобы убрать ⬆️ сразу)
+            con = ctx.bot_data.get("con")
+            if con:
+                apps = _coolify_apps_map()
+                for fqdn, info in apps.items():
+                    if info["uuid"] == app_uuid:
+                        latest = _gh_latest_sha(info["repo"], info["branch"])
+                        if latest:
+                            set_state(con, f"gh_sha:{app_uuid}", latest)
+                        break
+            msg = f"✅ Деплой запущен\n<code>{deploy_uuid}</code>"
+        except Exception as e:
+            msg = f"❌ Ошибка деплоя: {e}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back_status")]])
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
         return
 
     if query.data.startswith("restart:"):
@@ -873,7 +966,7 @@ def make_check_job(con):
 def make_daily_job(con):
     async def job(ctx: CallbackContext):
         record_daily_metrics(con)
-        text, kb = build_status()
+        text, kb = build_status(con)
         await ctx.bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode="HTML")
     return job
 
