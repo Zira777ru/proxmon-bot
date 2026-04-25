@@ -232,6 +232,30 @@ def docker_volume_sizes():
         log.error(f"Volume sizes: {e}")
         return []
 
+def _coolify_uuid_name_map() -> dict:
+    """Returns {coolify_uuid: friendly_name} for all apps."""
+    result = {}
+    hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
+    try:
+        for app in requests.get(f"{COOLIFY_API}/applications", headers=hdrs, timeout=5).json():
+            result[app["uuid"]] = app.get("name", app["uuid"])
+    except Exception as e:
+        log.error(f"UUID name map: {e}")
+    return result
+
+
+def _friendly_name(container_name: str, uuid_map: dict) -> str:
+    """Convert ugly Coolify container name to human-readable."""
+    for uuid, name in uuid_map.items():
+        if uuid in container_name:
+            return name
+    # Strip trailing -{uuid}-{number} or -{uuid}
+    import re
+    cleaned = re.sub(r"-[a-z0-9]{16,}-\d+$", "", container_name)
+    cleaned = re.sub(r"-[a-z0-9]{16,}$", "", cleaned)
+    return cleaned
+
+
 # ── Coolify discovery ─────────────────────────────────────────────────────────
 _watch_cache: list[str] = []
 _watch_ts: float = 0
@@ -378,12 +402,36 @@ def build_status(con=None):
             lines.append(f"{vm_icon(g['status'])} [{g['vmid']}] {g['name']}  RAM {mem_s}  CPU {g.get('cpu',0)*100:.1f}%")
 
     containers = docker_containers()
+    uuid_map = _coolify_uuid_name_map()
     stopped = [c for c in containers if c.status != "running"]
     lines += ["", f"🐳 {b('Docker')} ({len(containers)-len(stopped)}/{len(containers)} running)"]
     for c in sorted(stopped, key=lambda x: x.name):
-        lines.append(f"🔴 {c.name}")
+        lines.append(f"🔴 {_friendly_name(c.name, uuid_map)}")
     if not stopped:
         lines.append(f"🟢 Все контейнеры запущены")
+
+    # Боты — Coolify-приложения без публичного домена
+    hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
+    try:
+        bot_apps = [
+            a for a in requests.get(f"{COOLIFY_API}/applications", headers=hdrs, timeout=5).json()
+            if a.get("git_repository") and not any(
+                WATCH_DOMAIN_FILTER in (p.strip())
+                for p in (a.get("fqdn") or "").split(",")
+                if "sslip.io" not in p
+            )
+        ]
+        if bot_apps:
+            lines += ["", f"🤖 {b('Боты')}"]
+            for a in sorted(bot_apps, key=lambda x: x.get("name", "")):
+                uuid = a["uuid"]
+                # Найдём контейнер по UUID
+                matched = [c for c in containers if uuid in c.name]
+                status = matched[0].status if matched else "not found"
+                icon = "🟢" if status == "running" else "🔴"
+                lines.append(f"{icon} {a.get('name', uuid)}")
+    except Exception as e:
+        log.error(f"Bot apps: {e}")
 
     stor = storages()
     if stor:
@@ -815,18 +863,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             client = docker_client()
             containers = client.containers.list(all=True) if client else []
+            uuid_map = _coolify_uuid_name_map()
             running = [c for c in containers if c.status == "running"]
             stopped = [c for c in containers if c.status != "running"]
             lines = [f"🐳 <b>Docker контейнеры</b> ({len(running)}/{len(containers)})"]
             rows = []
             for c in sorted(running, key=lambda x: x.name):
-                short = c.name[:30]
-                lines.append(f"🟢 {short}")
-                rows.append([InlineKeyboardButton(f"📋 {c.name[:25]}", callback_data=f"ctr_logs:{c.id[:12]}")])
+                fname = _friendly_name(c.name, uuid_map)
+                lines.append(f"🟢 {fname}")
+                rows.append([InlineKeyboardButton(f"📋 {fname[:28]}", callback_data=f"ctr_logs:{c.id[:12]}")])
             for c in sorted(stopped, key=lambda x: x.name):
-                short = c.name[:30]
-                lines.append(f"🔴 {short}")
-                rows.append([InlineKeyboardButton(f"📋 {c.name[:25]}", callback_data=f"ctr_logs:{c.id[:12]}")])
+                fname = _friendly_name(c.name, uuid_map)
+                lines.append(f"🔴 {fname}")
+                rows.append([InlineKeyboardButton(f"📋 {fname[:28]}", callback_data=f"ctr_logs:{c.id[:12]}")])
             rows.append([InlineKeyboardButton("« Назад", callback_data="back_status")])
             await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML")
         except Exception as e:
