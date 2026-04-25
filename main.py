@@ -474,24 +474,9 @@ def build_status(con=None):
             upd_mark = " ⬆️" if has_update else ""
             lines.append(f"{'🟢' if ok else '🔴'} {name}{upd_mark}")
 
-    # Inline keyboard
-    kb_rows = []
-    kb_rows.append([InlineKeyboardButton("🐳 Список контейнеров", callback_data="docker_list")])
-    if watch:
-        svc_names = [url.replace("https://","").replace("http://","").split("/")[0] for url in watch]
-        row = []
-        for name in svc_names:
-            has_update = name in gh_updates
-            label = f"⬆️{name.split('.')[0][:10]}" if has_update else name.split(".")[0][:12]
-            cb = f"deploy_update:{gh_updates[name]['uuid']}" if has_update else f"svc_logs:{name}"
-            row.append(InlineKeyboardButton(label, callback_data=cb[:64]))
-            if len(row) == 3:
-                kb_rows.append(row)
-                row = []
-        if row:
-            kb_rows.append(row)
+    lines += ["", "─" * 20, "/logs — логи и контейнеры    /help — справка"]
 
-    return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
+    return "\n".join(lines)
 
 # ── Weekly trend ──────────────────────────────────────────────────────────────
 def build_weekly_trend(con) -> str:
@@ -754,26 +739,47 @@ async def run_ssl_checks(bot, con):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    text, kb = build_status(ctx.bot_data.get("con"))
-    await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+    await update.message.reply_text(build_status(ctx.bot_data.get("con")), parse_mode="HTML")
+
+async def _send_logs_menu(send_fn, con):
+    """Send the /logs interactive menu."""
+    gh_updates = check_github_updates(con) if con else {}
+    watch = discover_watch_urls()
+    uuid_map = _coolify_uuid_name_map()
+    containers = docker_containers()
+
+    lines = [f"📋 {b('Логи и управление')}"]
+
+    # Сервисы
+    if watch:
+        lines.append("")
+        lines.append(f"🌐 {b('Сервисы')}")
+    kb_rows = []
+    if watch:
+        svc_names = [url.replace("https://","").replace("http://","").split("/")[0] for url in watch]
+        row = []
+        for name in svc_names:
+            has_update = name in gh_updates
+            label = f"⬆️{name.split('.')[0][:10]}" if has_update else name.split(".")[0][:12]
+            cb = f"deploy_update:{gh_updates[name]['uuid']}" if has_update else f"svc_logs:{name}"
+            row.append(InlineKeyboardButton(label, callback_data=cb[:64]))
+            if len(row) == 3:
+                kb_rows.append(row)
+                row = []
+        if row:
+            kb_rows.append(row)
+
+    # Контейнеры
+    lines += ["", f"🐳 {b('Контейнеры')}"]
+    kb_rows.append([InlineKeyboardButton("🐳 Все контейнеры", callback_data="docker_list")])
+
+    await send_fn("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="HTML")
+
 
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    if not ctx.args:
-        await update.message.reply_text("Использование: /logs <имя_контейнера>")
-        return
-    name  = ctx.args[0].lower()
-    found = [c for c in docker_containers() if name in c.name.lower()]
-    if not found:
-        await update.message.reply_text(f"Контейнер '{name}' не найден.")
-        return
-    try:
-        logs = found[0].logs(tail=40).decode("utf-8", errors="replace").strip() or "(логи пусты)"
-        await update.message.reply_text(
-            f"📋 {b(found[0].name)}:\n\n<code>{logs[-3500:]}</code>", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+    await _send_logs_menu(update.message.reply_text, ctx.bot_data.get("con"))
 
 async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -876,7 +882,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 fname = _friendly_name(c.name, uuid_map)
                 lines.append(f"🔴 {fname}")
                 rows.append([InlineKeyboardButton(f"📋 {fname[:28]}", callback_data=f"ctr_logs:{c.id[:12]}")])
-            rows.append([InlineKeyboardButton("« Назад", callback_data="back_status")])
+            rows.append([InlineKeyboardButton("« Назад", callback_data="back_logs")])
             await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML")
         except Exception as e:
             await query.edit_message_text(f"❌ Ошибка: {e}")
@@ -889,7 +895,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         apps = _coolify_apps_map()
         uuid_hint = apps.get(hostname, {}).get("uuid", "")
         msg = _container_logs(subdomain, uuid_hint=uuid_hint)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back_status")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back_logs")]])
         await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
         return
 
@@ -906,9 +912,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
         return
 
-    if query.data == "back_status":
-        text, kb = build_status(ctx.bot_data.get("con"))
-        await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+    if query.data == "back_logs":
+        await _send_logs_menu(query.edit_message_text, ctx.bot_data.get("con"))
         return
 
     if query.data.startswith("deploy_update:"):
@@ -931,7 +936,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             msg = f"✅ Деплой запущен\n<code>{deploy_uuid}</code>"
         except Exception as e:
             msg = f"❌ Ошибка деплоя: {e}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back_status")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back_logs")]])
         await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
         return
 
@@ -1021,8 +1026,7 @@ def make_check_job(con):
 def make_daily_job(con):
     async def job(ctx: CallbackContext):
         record_daily_metrics(con)
-        text, kb = build_status(con)
-        await ctx.bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode="HTML")
+        await ctx.bot.send_message(ADMIN_ID, build_status(con), parse_mode="HTML")
     return job
 
 def make_ssl_job(con):
