@@ -377,6 +377,27 @@ def url_ok(url):
     except:
         return False
 
+OFFSITE_STATUS_FILE = "/data/offsite_backup.json"
+
+def _offsite_backup_line() -> str:
+    import json as _json
+    try:
+        with open(OFFSITE_STATUS_FILE) as f:
+            d = _json.load(f)
+        ts = d.get("timestamp", 0)
+        age_h = (time.time() - ts) / 3600
+        size = d.get("size", "?")
+        dur = d.get("duration_s", 0)
+        if d.get("status") == "ok":
+            icon = "⚠️" if age_h > 26 else "✅"
+            return f"{icon} Offsite (gdrive): {size}  {age_h:.0f}ч назад  ({dur}с)"
+        else:
+            return f"❌ Offsite (gdrive): FAILED  {age_h:.0f}ч назад"
+    except FileNotFoundError:
+        return "⏳ Offsite (gdrive): нет данных"
+    except Exception:
+        return "❓ Offsite (gdrive): ошибка чтения статуса"
+
 # ── Status ────────────────────────────────────────────────────────────────────
 def build_status(con=None):
     lines = [f"📊 {b('Proxmox Monitor')}  {datetime.now().strftime('%d.%m %H:%M')}"]
@@ -461,6 +482,7 @@ def build_status(con=None):
         age = last_backup_age_hours(100)
         if age is not None:
             lines.append(f"{'⚠️' if age > BACKUP_MAX_AGE_H else '✅'} Последний бэкап VM 100: {age:.0f}ч назад")
+        lines.append(_offsite_backup_line())
 
     gh_updates = check_github_updates(con) if con else {}
 
