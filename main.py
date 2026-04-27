@@ -385,14 +385,20 @@ def _offsite_backup_line() -> str:
         with open(OFFSITE_STATUS_FILE) as f:
             d = _json.load(f)
         ts = d.get("timestamp", 0)
-        age_h = (time.time() - ts) / 3600
+        age_s = time.time() - ts
+        age_h = age_s / 3600
+        if age_s < 3600:
+            age_str = f"{int(age_s / 60)}м назад"
+        elif age_h < 48:
+            age_str = f"{age_h:.0f}ч назад"
+        else:
+            age_str = f"{age_h / 24:.0f}д назад"
         size = d.get("size", "?")
-        dur = d.get("duration_s", 0)
         if d.get("status") == "ok":
             icon = "⚠️" if age_h > 26 else "✅"
-            return f"{icon} Offsite (gdrive): {size}  {age_h:.0f}ч назад  ({dur}с)"
+            return f"{icon} Offsite (gdrive): {size}  {age_str}"
         else:
-            return f"❌ Offsite (gdrive): FAILED  {age_h:.0f}ч назад"
+            return f"❌ Offsite (gdrive): FAILED  {age_str}"
     except FileNotFoundError:
         return "⏳ Offsite (gdrive): нет данных"
     except Exception:
