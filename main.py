@@ -408,6 +408,7 @@ def _offsite_backup_line() -> str:
 def build_status(con=None):
     lines = [f"📊 {b('Proxmox Monitor')}  {datetime.now().strftime('%d.%m %H:%M')}"]
 
+    # Node
     node = node_status()
     if node:
         cpu  = node["cpu"] * 100
@@ -421,88 +422,113 @@ def build_status(con=None):
     else:
         lines += ["", f"🔴 {b('Proxmox недоступен!')}"]
 
+    # VMs — RAM в GB вместо %
     all_guests = sorted(vms() + lxc(), key=lambda x: x["vmid"])
     if all_guests:
         lines += ["", f"🖧 {b('VMs')}"]
         for g in all_guests:
-            mem_s = f"{pct(g.get('mem',0), g.get('maxmem',1)):.0f}%" if g.get("maxmem") else "—"
-            lines.append(f"{vm_icon(g['status'])} [{g['vmid']}] {g['name']}  RAM {mem_s}  CPU {g.get('cpu',0)*100:.1f}%")
+            if g.get("maxmem"):
+                used_gb = g.get("mem", 0) / 1024**3
+                max_gb  = g["maxmem"] / 1024**3
+                mem_s = f"{used_gb:.1f}/{max_gb:.0f} GB"
+            else:
+                mem_s = "—"
+            lines.append(f"{vm_icon(g['status'])} [{g['vmid']}] {g['name']}  {mem_s}  CPU {g.get('cpu',0)*100:.1f}%")
 
+    # Docker — одна строка если всё ОК, иначе список упавших
     containers = docker_containers()
     uuid_map = _coolify_uuid_name_map()
-    stopped = [c for c in containers if c.status != "running"]
-    lines += ["", f"🐳 {b('Docker')} ({len(containers)-len(stopped)}/{len(containers)} running)"]
-    for c in sorted(stopped, key=lambda x: x.name):
-        lines.append(f"🔴 {_friendly_name(c.name, uuid_map)}")
-    if not stopped:
-        lines.append(f"🟢 Все контейнеры запущены")
+    not_running = [c for c in containers if c.status != "running"]
+    d_icon = "🟢" if not not_running else "⚠️"
+    lines += ["", f"🐳 {b('Docker')}: {d_icon} {len(containers)-len(not_running)}/{len(containers)}"]
+    for c in sorted(not_running, key=lambda x: x.name):
+        lines.append(f"  🔴 {_friendly_name(c.name, uuid_map)}")
 
-    # Боты — Coolify-приложения без публичного домена
+    # Боты — компактно; running:* → 🟢, иначе ⏸ (остановлен/выключен), крэш → 🔴
     hdrs = {"Authorization": f"Bearer {COOLIFY_TOKEN}"}
     try:
         bot_apps = [
             a for a in requests.get(f"{COOLIFY_API}/applications", headers=hdrs, timeout=5).json()
             if a.get("git_repository") and not any(
-                WATCH_DOMAIN_FILTER in (p.strip())
+                WATCH_DOMAIN_FILTER in p.strip()
                 for p in (a.get("fqdn") or "").split(",")
                 if "sslip.io" not in p
             )
         ]
         if bot_apps:
-            lines += ["", f"🤖 {b('Боты')}"]
+            ok_bots, stopped_bots, crashed_bots = [], [], []
             for a in sorted(bot_apps, key=lambda x: x.get("name", "")):
-                uuid = a["uuid"]
-                # Найдём контейнер по UUID
-                matched = [c for c in containers if uuid in c.name]
-                status = matched[0].status if matched else "not found"
-                icon = "🟢" if status == "running" else "🔴"
-                lines.append(f"{icon} {a.get('name', uuid)}")
+                name = a.get("name", a["uuid"])
+                coolify_st = a.get("status", "")
+                matched = [c for c in containers if a["uuid"] in c.name]
+                if matched and matched[0].status == "running":
+                    ok_bots.append(name)
+                elif matched and matched[0].status not in ("running", "exited"):
+                    crashed_bots.append(name)
+                elif coolify_st.startswith("running"):
+                    crashed_bots.append(name)
+                else:
+                    stopped_bots.append(name)
+            b_icon = "⚠️" if crashed_bots else "🟢"
+            b_line = f"🤖 {b('Боты')}: {b_icon} {len(ok_bots)}/{len(ok_bots)+len(crashed_bots)}"
+            for name in crashed_bots:
+                b_line += f"\n  🔴 {name}"
+            for name in stopped_bots:
+                b_line += f"  ⏸ {name}"
+            lines += ["", b_line]
     except Exception as e:
         log.error(f"Bot apps: {e}")
 
+    # Storage — без local-lvm (LVM-пул), цифры в целых ГБ
     stor = storages()
-    if stor:
-        lines += ["", f"💾 {b('Storage')}"]
-        for s in stor:
-            if s.get("total", 0) > 0:
-                p = pct(s["used"], s["total"])
-                warn = "⚠️ " if p > DISK_WARN else ""
-                lines.append(f"{warn}{s['storage']}: {p:.0f}%  {fmt_gb(s['used'])}/{fmt_gb(s['total'])}")
+    stor_lines = []
+    for s in stor:
+        if s.get("total", 0) > 0 and "lvm" not in s["storage"].lower():
+            p = pct(s["used"], s["total"])
+            warn = "⚠️ " if p > DISK_WARN else ""
+            used_gb  = round(s["used"]  / 1024**3)
+            total_gb = round(s["total"] / 1024**3)
+            stor_lines.append(f"{warn}{s['storage']}: {p:.0f}%  {used_gb}/{total_gb} GB")
+    if stor_lines:
+        lines += ["", f"💾 {b('Storage')}"] + stor_lines
 
     # Top volumes
     vols = [v for v in docker_volume_sizes() if v["size"] > 1024**3][:5]
     if vols:
         lines += ["", f"📦 {b('Volumes (топ)')}"]
         for v in vols:
-            warn = "⚠️ " if v["size"] > VOLUME_WARN_GB * 1024**3 else ""
+            warn  = "⚠️ " if v["size"] > VOLUME_WARN_GB * 1024**3 else ""
             short = v["name"][-40:] if len(v["name"]) > 40 else v["name"]
             lines.append(f"{warn}{fmt_gb(v['size'])}  {short}")
 
+    # Бэкапы
     bkps = backups()
     if bkps:
         lines += ["", f"🗄 {b('Бэкапы')}"]
         for bk in bkps:
             nxt  = datetime.fromtimestamp(bk["next-run"]).strftime("%d.%m %H:%M") if bk.get("next-run") else "—"
             keep = bk.get("prune-backups", {}).get("keep-last", "?")
-            lines.append(f"{'✅' if bk.get('enabled') else '⏸'} {bk['schedule']}  след: {nxt}  хранить: {keep}")
-        age = last_backup_age_hours(100)
-        if age is not None:
-            lines.append(f"{'⚠️' if age > BACKUP_MAX_AGE_H else '✅'} Последний бэкап VM 100: {age:.0f}ч назад")
+            age  = last_backup_age_hours(100)
+            age_s = f"{age:.0f}ч назад" if age is not None else "—"
+            age_icon = "⚠️" if age and age > BACKUP_MAX_AGE_H else "✅"
+            lines.append(f"{age_icon} Proxmox: {age_s}  →  {nxt}  (хранить {keep})")
         lines.append(_offsite_backup_line())
 
+    # Сервисы — одна строка если всё ОК, иначе только упавшие
     gh_updates = check_github_updates(con) if con else {}
-
     watch = discover_watch_urls()
     if watch:
-        lines += ["", f"🌐 {b('Сервисы')} ({len(watch)})"]
-        for url in watch:
-            ok   = url_ok(url)
-            name = url.replace("https://","").replace("http://","").split("/")[0]
-            has_update = name in gh_updates
-            upd_mark = " ⬆️" if has_update else ""
-            lines.append(f"{'🟢' if ok else '🔴'} {name}{upd_mark}")
+        results = {u: url_ok(u) for u in watch}
+        failed  = [u for u, ok in results.items() if not ok]
+        ok_count = len(watch) - len(failed)
+        s_icon = "🟢" if not failed else "⚠️"
+        lines += ["", f"🌐 {b('Сервисы')}: {s_icon} {ok_count}/{len(watch)}"]
+        for url in failed:
+            name = url.replace("https://", "").replace("http://", "").split("/")[0]
+            upd_mark = " ⬆️" if name in gh_updates else ""
+            lines.append(f"  🔴 {name}{upd_mark}")
 
-    lines += ["", "─" * 20, "/logs — логи и контейнеры    /help — справка"]
+    lines += ["", "─" * 20, "/status  /logs  /help"]
 
     return "\n".join(lines)
 
