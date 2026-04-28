@@ -49,6 +49,7 @@ GITHUB_TOKEN        = os.getenv("GITHUB_TOKEN", "")
 KEENETIC_HOST       = os.getenv("KEENETIC_HOST", "192.168.0.1")
 KEENETIC_USER       = os.getenv("KEENETIC_USER", "admin")
 KEENETIC_PASS       = os.getenv("KEENETIC_PASS", "")
+LOCAL_VMID          = int(os.getenv("LOCAL_VMID", "100"))
 
 PX_BASE    = f"https://{PX_HOST}:8006/api2/json"
 PX_HEADERS = {"Authorization": f"PVEAPIToken={PX_USER}!{PX_TOKEN_NAME}={PX_TOKEN_VALUE}"}
@@ -160,6 +161,19 @@ def vms():         return px(f"/nodes/{PX_NODE}/qemu") or []
 def lxc():         return px(f"/nodes/{PX_NODE}/lxc") or []
 def storages():    return px(f"/nodes/{PX_NODE}/storage") or []
 def backups():     return px("/cluster/backup") or []
+
+def local_proc_mem():
+    """Real in-guest memory usage from /proc/meminfo (MemTotal - MemAvailable)."""
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    info[parts[0].strip()] = int(parts[1].split()[0]) * 1024
+        return info["MemTotal"] - info["MemAvailable"], info["MemTotal"]
+    except Exception:
+        return None, None
 
 def last_backup_age_hours(vmid):
     data = px(f"/nodes/{PX_NODE}/storage/backup-disk/content?content=backup&vmid={vmid}")
@@ -532,8 +546,17 @@ def build_status(con=None):
         lines += ["", f"🖧 {b('VMs')}"]
         for g in all_guests:
             if g.get("maxmem"):
-                used_gb = g.get("mem", 0) / 1024**3
-                max_gb  = g["maxmem"] / 1024**3
+                if g.get("vmid") == LOCAL_VMID:
+                    used_bytes, total_bytes = local_proc_mem()
+                    if used_bytes:
+                        used_gb = used_bytes / 1024**3
+                        max_gb  = total_bytes / 1024**3
+                    else:
+                        used_gb = g.get("mem", 0) / 1024**3
+                        max_gb  = g["maxmem"] / 1024**3
+                else:
+                    used_gb = g.get("mem", 0) / 1024**3
+                    max_gb  = g["maxmem"] / 1024**3
                 mem_s = f"{used_gb:.1f}/{max_gb:.0f} GB"
             else:
                 mem_s = "—"
