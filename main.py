@@ -46,6 +46,9 @@ COOLIFY_API         = os.getenv("COOLIFY_API_URL", "http://host.docker.internal:
 COOLIFY_TOKEN       = os.getenv("COOLIFY_API_TOKEN", "")
 WATCH_DOMAIN_FILTER = os.getenv("WATCH_DOMAIN_FILTER", "coscore.us")
 GITHUB_TOKEN        = os.getenv("GITHUB_TOKEN", "")
+KEENETIC_HOST       = os.getenv("KEENETIC_HOST", "192.168.0.1")
+KEENETIC_USER       = os.getenv("KEENETIC_USER", "admin")
+KEENETIC_PASS       = os.getenv("KEENETIC_PASS", "")
 
 PX_BASE    = f"https://{PX_HOST}:8006/api2/json"
 PX_HEADERS = {"Authorization": f"PVEAPIToken={PX_USER}!{PX_TOKEN_NAME}={PX_TOKEN_VALUE}"}
@@ -404,6 +407,96 @@ def _offsite_backup_line() -> str:
     except Exception:
         return "❓ Offsite (gdrive): ошибка чтения статуса"
 
+# ── Keenetic Router ───────────────────────────────────────────────────────────
+def _keenetic_cmd(commands: list[str], timeout: int = 8) -> str:
+    if not KEENETIC_PASS:
+        return ""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((KEENETIC_HOST, 23))
+
+        def recv_until(marker: bytes) -> bytes:
+            buf = b""
+            while marker not in buf:
+                chunk = s.recv(512)
+                if not chunk:
+                    break
+                i, clean = 0, b""
+                while i < len(chunk):
+                    if chunk[i] == 0xFF and i + 2 < len(chunk):
+                        i += 3  # skip IAC negotiation
+                    else:
+                        clean += chunk[i:i+1]
+                        i += 1
+                buf += clean
+            return buf
+
+        recv_until(b"Login:")
+        s.send(f"{KEENETIC_USER}\r\n".encode())
+        recv_until(b"Password:")
+        s.send(f"{KEENETIC_PASS}\r\n".encode())
+        recv_until(b">")
+
+        out = ""
+        for cmd in commands:
+            s.send(f"{cmd}\r\n".encode())
+            time.sleep(0.5)
+            buf = b""
+            s.settimeout(3)
+            try:
+                while True:
+                    buf += s.recv(2048)
+            except socket.timeout:
+                pass
+            text = buf.decode(errors="ignore")
+            text = re.sub(r"\x1b\[[^m]*[mK]|\r|\x08.", "", text)
+            out += text
+
+        s.close()
+        return out
+    except Exception as e:
+        log.debug(f"Keenetic connect: {e}")
+        return ""
+
+
+def keenetic_status() -> dict | None:
+    out = _keenetic_cmd(["show system", "show interface WifiMaster0/WifiStation0"])
+    if not out:
+        return None
+    r: dict = {}
+    m = re.search(r"hostname:\s*(\S+)", out)
+    r["hostname"] = m.group(1) if m else "Keenetic"
+    m = re.search(r"uptime:\s*(\d+)", out)
+    r["uptime"] = int(m.group(1)) if m else 0
+    m = re.search(r"cpuload:\s*(\d+)", out)
+    r["cpu"] = int(m.group(1)) if m else 0
+    m = re.search(r"memory:\s*(\d+)/(\d+)", out)
+    r["mem"] = round(int(m.group(1)) / int(m.group(2)) * 100) if m else 0
+    m = re.search(r"address:\s*([\d.]+)", out)
+    r["wan_ip"] = m.group(1) if m else ""
+    r["wan_ok"] = "connected: yes" in out and bool(r["wan_ip"])
+    return r
+
+
+def keenetic_devices() -> list[dict]:
+    out = _keenetic_cmd(["show ip hotspot"])
+    devices = []
+    for block in re.split(r"host:\s*\n", out):
+        if "active: yes" not in block:
+            continue
+        mac  = re.search(r"mac:\s*(\S+)", block)
+        ip   = re.search(r"ip:\s*([\d.]+)", block)
+        name = re.search(r"hostname:\s*(.+)", block)
+        if mac and ip:
+            devices.append({
+                "mac":  mac.group(1),
+                "ip":   ip.group(1),
+                "name": name.group(1).strip() if name else mac.group(1),
+            })
+    return devices
+
+
 # ── Status ────────────────────────────────────────────────────────────────────
 def build_status(con=None):
     lines = [f"📊 {b('Proxmox Monitor')}  {datetime.now().strftime('%d.%m %H:%M')}"]
@@ -421,6 +514,17 @@ def build_status(con=None):
                   f"Uptime: {uptime_str(node['uptime'])}"]
     else:
         lines += ["", f"🔴 {b('Proxmox недоступен!')}"]
+
+    # Router
+    router = keenetic_status()
+    if router:
+        wan_icon = "🟢" if router["wan_ok"] else "🔴"
+        lines += ["", f"📡 {b('Роутер: ' + router['hostname'])}",
+                  f"{wan_icon} WAN: {router['wan_ip'] or '—'}  "
+                  f"CPU {router['cpu']}%  RAM {router['mem']}%  "
+                  f"⬆ {uptime_str(router['uptime'])}"]
+    else:
+        lines += ["", f"📡 {b('Роутер')}: 🔴 недоступен"]
 
     # VMs — RAM в GB вместо %
     all_guests = sorted(vms() + lxc(), key=lambda x: x["vmid"])
@@ -598,6 +702,21 @@ async def run_checks(bot, con):
                 recovery(f"✅ {b(name)} в норме: {value:.0f}%")
                 clear_alert(con, key)
             set_state(con, f"{key}_f", "0")
+
+    # ── Keenetic WAN
+    if KEENETIC_PASS:
+        router = keenetic_status()
+        wan_key = "keenetic_wan"
+        if router is not None and not router["wan_ok"]:
+            set_state(con, f"{wan_key}_f", "1")
+            alert(wan_key, f"🔴 {b('Роутер: WAN упал!')}",
+                  "WAN интерфейс не подключён",
+                  f"Keenetic {KEENETIC_HOST}")
+        elif router is not None and router["wan_ok"]:
+            if get_state(con, f"{wan_key}_f") == "1":
+                recovery(f"🟢 {b('Роутер: WAN восстановлен')}")
+            set_state(con, f"{wan_key}_f", "0")
+            clear_alert(con, wan_key)
 
     # ── Proxmox доступность
     node = node_status()
@@ -794,6 +913,27 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text(build_status(ctx.bot_data.get("con")), parse_mode="HTML")
+
+async def cmd_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    router = keenetic_status()
+    if not router:
+        await update.message.reply_text("📡 Роутер недоступен", parse_mode="HTML")
+        return
+    wan_icon = "🟢" if router["wan_ok"] else "🔴"
+    lines = [
+        f"📡 {b(router['hostname'])}",
+        f"{wan_icon} WAN: {router['wan_ip'] or '—'}",
+        f"CPU: {router['cpu']}%  RAM: {router['mem']}%",
+        f"Uptime: {uptime_str(router['uptime'])}",
+    ]
+    devices = keenetic_devices()
+    if devices:
+        lines += ["", f"👥 {b(f'Онлайн: {len(devices)}')}"]
+        for d in sorted(devices, key=lambda x: x["ip"]):
+            lines.append(f"  <code>{d['ip']:<15}</code> {d['name']}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def _send_logs_menu(send_fn, con):
     """Send the /logs interactive menu."""
@@ -1048,6 +1188,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🤖 {b('Proxmox Monitor Bot')}\n\n"
         f"{b('Команды:')}\n"
         "/status — полный статус сервера\n"
+        "/router — статус роутера + список устройств\n"
         "/logs &lt;имя&gt; — последние 40 строк логов\n"
         "/restart &lt;имя&gt; — перезапустить Docker контейнер\n"
         "/reboot [vmid|имя] — перезагрузить VM (без аргумента — список)\n"
@@ -1100,6 +1241,7 @@ async def main():
     app.bot_data["con"] = con
 
     app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("router",    cmd_router))
     app.add_handler(CommandHandler("logs",      cmd_logs))
     app.add_handler(CommandHandler("restart",   cmd_restart))
     app.add_handler(CommandHandler("reboot",    cmd_reboot))

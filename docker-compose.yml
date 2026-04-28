@@ -29,6 +29,9 @@ services:
       - DB_PATH=/data/monitor.db
       - BACKUP_WINDOW_START=2
       - BACKUP_WINDOW_END=4
+      - KEENETIC_HOST=192.168.0.1
+      - KEENETIC_USER=admin
+      - KEENETIC_PASS=
 
 volumes:
   proxmon-data:
